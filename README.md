@@ -45,7 +45,7 @@ cd clients/kotlin
 ./gradlew build                # Full build (compile + tests)
 
 # Register & login (note: args must be in quotes)
-./gradlew run --args='--user alice --password secret'
+./gradlew run --args='--user alice --password Abc@123'
 
 # Or run the JAR directly
 ./gradlew jar  # Build the JAR first
