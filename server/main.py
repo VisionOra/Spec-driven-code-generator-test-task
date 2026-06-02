@@ -4,8 +4,13 @@ from store import store
 
 app = FastAPI()
 
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
 class LoginRequest(BaseModel):
     username: str
+    password: str
 
 class SendRequest(BaseModel):
     to: str
@@ -19,9 +24,21 @@ def auth(session_id: str | None) -> str:
         raise HTTPException(401, "Invalid session")
     return user
 
+@app.post("/register", status_code=201)
+def register(req: RegisterRequest):
+    try:
+        return store.register(req.username, req.password)
+    except ValueError as e:
+        if str(e) == "username_taken":
+            raise HTTPException(409, {"error": "username_taken"})
+        raise
+
 @app.post("/login")
 def login(req: LoginRequest):
-    return store.login(req.username)
+    try:
+        return store.login(req.username, req.password)
+    except ValueError:
+        raise HTTPException(401, {"error": "invalid_credentials"})
 
 @app.post("/send")
 def send(req: SendRequest, x_session_id: str | None = Header(None)):

@@ -10,13 +10,27 @@ Authentication: every request except /login carries header `X-Session-Id: <sessi
 
 ## 2. API Endpoints
 
+### POST /register
+Request:
+  { "username": "alice", "password": "secret" }
+Response 201:
+  { "userId": "uuid", "username": "alice" }
+Response 409:
+  { "error": "username_taken" }
+Notes:
+  - Username must be unique. On 409, client shows error and prompts for a different name.
+  - Password is bcrypt-hashed server-side; plaintext is never stored.
+
 ### POST /login
 Request:
-  { "username": "alice" }
+  { "username": "alice", "password": "secret" }
 Response 200:
   { "userId": "uuid", "username": "alice", "sessionId": "uuid" }
+Response 401:
+  { "error": "invalid_credentials" }
 Notes:
-  - Username collision is NOT an error. Re-login creates a new session for same user.
+  - Returns the same 401 for unknown username and wrong password (no enumeration).
+  - Re-login invalidates the previous session and issues a new sessionId.
   - Client stores sessionId in memory for the session lifetime.
 
 ### POST /send
@@ -86,6 +100,7 @@ Server-assigned id is stored in serverId only after ACK.
 
 ```
 LOGGED_OUT   — no session
+REGISTERING  — POST /register in flight
 LOGGING_IN   — POST /login in flight
 ONLINE       — session active, sync loop running every 3 seconds
 FLUSHING     — session active, draining offline queue
@@ -97,19 +112,24 @@ OFFLINE      — session saved, no network
 ## 5. State Transitions
 
 ```
-LOGGED_OUT  + login()                → LOGGING_IN
-LOGGING_IN  + 200 response           → ONLINE (start sync loop)
-LOGGING_IN  + error                  → LOGGED_OUT
-ONLINE      + network lost           → OFFLINE (stop sync loop)
-ONLINE      + user sends message     → ONLINE (queue + immediate POST /send)
-ONLINE      + POST /send fails       → FLUSHING (message stays pending in queue)
-FLUSHING    + queue drained          → ONLINE (restart sync loop)
-FLUSHING    + network lost           → OFFLINE
-FLUSHING    + user sends message     → FLUSHING (append to queue tail — no second flush)
-OFFLINE     + network restored       → FLUSHING (if queue non-empty) or ONLINE
-OFFLINE     + user sends message     → OFFLINE (queue locally, status=pending)
-ANY         + 401 response           → LOGGED_OUT (keep queue, clear sessionId)
-ONLINE      + logout()               → LOGGED_OUT (POST /logout best-effort)
+LOGGED_OUT   + register()             → REGISTERING
+REGISTERING  + 201 response           → LOGGED_OUT (prompt user to now login)
+REGISTERING  + 409 username_taken     → LOGGED_OUT (surface error: pick another username)
+REGISTERING  + network error          → LOGGED_OUT (surface error: try again)
+LOGGED_OUT   + login()                → LOGGING_IN
+LOGGING_IN   + 200 response           → ONLINE (start sync loop)
+LOGGING_IN   + 401 invalid_creds      → LOGGED_OUT (surface error: wrong username/password)
+LOGGING_IN   + network error          → LOGGED_OUT (surface error: try again)
+ONLINE       + network lost           → OFFLINE (stop sync loop)
+ONLINE       + user sends message     → ONLINE (queue + immediate POST /send)
+ONLINE       + POST /send fails       → FLUSHING (message stays pending in queue)
+FLUSHING     + queue drained          → ONLINE (restart sync loop)
+FLUSHING     + network lost           → OFFLINE
+FLUSHING     + user sends message     → FLUSHING (append to queue tail — no second flush)
+OFFLINE      + network restored       → FLUSHING (if queue non-empty) or ONLINE
+OFFLINE      + user sends message     → OFFLINE (queue locally, status=pending)
+ANY          + 401 response           → LOGGED_OUT (keep queue, clear sessionId)
+ONLINE       + logout()               → LOGGED_OUT (POST /logout best-effort)
 ```
 
 ---

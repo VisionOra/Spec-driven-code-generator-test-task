@@ -1,26 +1,37 @@
 import threading, uuid, time
+import bcrypt
 
 class Store:
     def __init__(self):
         self._lock = threading.Lock()
-        self._users = {}     # username → {userId, sessionId}
+        self._users = {}     # username → {userId, username, passwordHash, sessionId}
         self._sessions = {}  # sessionId → username
         self._messages = []  # append-only
 
-    def login(self, username: str) -> dict:
+    def register(self, username: str, password: str) -> dict:
         with self._lock:
-            session_id = str(uuid.uuid4())
             if username in self._users:
-                self._sessions.pop(self._users[username]["sessionId"], None)
-                self._users[username]["sessionId"] = session_id
-            else:
-                self._users[username] = {
-                    "userId": str(uuid.uuid4()),
-                    "username": username,
-                    "sessionId": session_id
-                }
+                raise ValueError("username_taken")
+            user_id = str(uuid.uuid4())
+            self._users[username] = {
+                "userId": user_id,
+                "username": username,
+                "passwordHash": bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(),
+                "sessionId": None,
+            }
+            return {"userId": user_id, "username": username}
+
+    def login(self, username: str, password: str) -> dict:
+        with self._lock:
+            user = self._users.get(username)
+            if not user or not bcrypt.checkpw(password.encode(), user["passwordHash"].encode()):
+                raise ValueError("invalid_credentials")
+            if user["sessionId"]:
+                self._sessions.pop(user["sessionId"], None)
+            session_id = str(uuid.uuid4())
+            user["sessionId"] = session_id
             self._sessions[session_id] = username
-            return dict(self._users[username])
+            return {"userId": user["userId"], "username": username, "sessionId": session_id}
 
     def get_user_by_session(self, session_id: str) -> str | None:
         return self._sessions.get(session_id)

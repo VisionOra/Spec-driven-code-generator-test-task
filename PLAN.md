@@ -57,7 +57,7 @@ git add . && git commit -m "feat: initial project structure"
 - `POST /register` — creates a new account. Returns 409 if username already taken.
 - `POST /login` — authenticates an existing account with password. Returns 401 if wrong credentials.
 
-**Password storage:** hash with `bcrypt` (never store plaintext). Use `passlib[bcrypt]`.
+**Password storage:** hash with `bcrypt` (never store plaintext). Use the `bcrypt` package directly (`bcrypt.hashpw` / `bcrypt.checkpw`).
 
 **Duplicate username:** registration returns HTTP 409 Conflict with `{"error": "username_taken"}`. Clients must surface this to the user and prompt for a different name.
 
@@ -71,15 +71,13 @@ git add . && git commit -m "feat: initial project structure"
 ```
 fastapi
 uvicorn
-passlib[bcrypt]
+bcrypt
 ```
 
 ### `server/store.py`
 ```python
 import threading, uuid, time
-from passlib.context import CryptContext
-
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+import bcrypt
 
 class Store:
     def __init__(self):
@@ -97,7 +95,7 @@ class Store:
             self._users[username] = {
                 "userId": user_id,
                 "username": username,
-                "passwordHash": pwd_ctx.hash(password),
+                "passwordHash": bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(),
                 "sessionId": None,
             }
             return {"userId": user_id, "username": username}
@@ -106,7 +104,7 @@ class Store:
         """Returns {userId, username, sessionId} or raises ValueError('invalid_credentials')."""
         with self._lock:
             user = self._users.get(username)
-            if not user or not pwd_ctx.verify(password, user["passwordHash"]):
+            if not user or not bcrypt.checkpw(password.encode(), user["passwordHash"].encode()):
                 raise ValueError("invalid_credentials")
             # Invalidate old session
             if user["sessionId"]:

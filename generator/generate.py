@@ -20,7 +20,8 @@ def build_prompt(lang: str, spec: str, errors: str = "") -> str:
 
 def call_claude(prompt: str) -> str:
     result = subprocess.run(
-        ["claude", "--print"],
+        ["claude", "--print",
+         "--disallowedTools", "Edit,Write,Bash,computer,str_replace_based_edit_tool"],
         input=prompt, capture_output=True, text=True, timeout=300
     )
     if result.returncode != 0:

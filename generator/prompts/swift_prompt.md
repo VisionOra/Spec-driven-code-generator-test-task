@@ -1,3 +1,5 @@
+IMPORTANT: You are in pure text output mode. Do NOT use any tools. Do NOT write any files. Do NOT call Edit, Write, or Bash. Output ALL code as plain text in the exact format described below — nothing else.
+
 You are generating a Swift CLI messaging client. Implement the spec below exactly.
 
 ## Environment
@@ -25,17 +27,19 @@ Each file must begin with exactly this line (so the harness can extract it):
 **Models.swift** — Codable structs:
 - `WireMessage`: id, from, to, text, timestamp, status
 - `QueuedMessage`: localId, serverId (optional), toUser, text, queuedAt, status enum
+- `RegisterResponse`: userId, username
 - `LoginResponse`: userId, username, sessionId
 - `SendResponse`: id, timestamp
 - `MessagesResponse`: messages array, serverTimestamp
 
 **NetworkClient.swift** — URLSession wrapper:
-- `func login(username: String, serverURL: String) async throws -> LoginResponse`
+- `func register(username: String, password: String, serverURL: String) async throws -> RegisterResponse`
+- `func login(username: String, password: String, serverURL: String) async throws -> LoginResponse`
 - `func send(to: String, text: String, sessionId: String, serverURL: String) async throws -> SendResponse`
 - `func getMessages(since: Int64, sessionId: String, serverURL: String) async throws -> MessagesResponse`
 - `func logout(sessionId: String, serverURL: String) async`
 - All requests set Content-Type: application/json and X-Session-Id header where required
-- Throw a typed NetworkError (unauthorized, serverError, connectionFailed)
+- Throw a typed NetworkError enum: unauthorized, usernameTaken, serverError, connectionFailed
 
 **OfflineQueue.swift** — SQLite.swift backed queue:
 - Open/create database at `~/.messaging-cli/queue.db`
@@ -55,29 +59,33 @@ Each file must begin with exactly this line (so the harness can extract it):
 - Start monitoring on init
 
 **MessageClient.swift** — state machine + orchestrator:
-- Implement all 5 states: loggedOut, loggingIn, online, flushing, offline
+- Implement all 6 states: loggedOut, registering, loggingIn, online, flushing, offline
 - Sync loop: poll every 3 seconds when online
 - Flush loop: run flushQueue() algorithm from spec exactly
 - On transition offline→online: immediate poll before waiting 3s
-- `func login(username: String) async`
+- `func register(username: String, password: String) async`
+- `func login(username: String, password: String) async`
 - `func sendMessage(to: String, text: String) async`
 - `func logout() async`
 - `var onMessageReceived: ((WireMessage) -> Void)?`
 - `var onStateChange: ((String) -> Void)?`
+- `var onError: ((String) -> Void)?` — called with "username_taken" or "invalid_credentials"
 
 **main.swift** — CLI entry point:
-- Args: `--user <name>` (required), `--server <url>` (default: http://localhost:8765)
+- Args: `--user <name>`, `--password <pass>`, `--server <url>` (default: http://localhost:8765)
+- If --user/--password not provided, prompt on stdin: first ask "register or login?", then username, then password
 - After login, enter a read loop on stdin
 - Commands:
   - `send <username> <message text>` — send a message
-  - `offline` — simulate going offline (stop network calls, set isOnline=false)
+  - `offline` — simulate going offline
   - `online` — simulate coming back online
   - `quit` — logout and exit
 - Print received messages as: `RECEIVED from <username>: <text>`
 - Print state changes as: `STATE: <state>`
+- Print errors as: `ERROR: <reason>` (e.g. username_taken, invalid_credentials)
 
 ## Requirements
 - No chat or messaging SDKs
 - No Combine, no SwiftUI
 - All network calls must handle URLError.notConnectedToInternet as connectionFailed
-- The binary must work: `swift run messaging-cli --user alice`
+- The binary must work: `swift run messaging-cli --user alice --password secret`
