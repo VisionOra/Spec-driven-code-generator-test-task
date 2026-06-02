@@ -51,37 +51,70 @@ git add . && git commit -m "feat: initial project structure"
 
 ## Step 2: Python Server
 
+### Auth design decisions (read before coding)
+
+**Registration vs login are separate operations:**
+- `POST /register` — creates a new account. Returns 409 if username already taken.
+- `POST /login` — authenticates an existing account with password. Returns 401 if wrong credentials.
+
+**Password storage:** hash with `bcrypt` (never store plaintext). Use `passlib[bcrypt]`.
+
+**Duplicate username:** registration returns HTTP 409 Conflict with `{"error": "username_taken"}`. Clients must surface this to the user and prompt for a different name.
+
+**Wrong password at login:** returns HTTP 401 with `{"error": "invalid_credentials"}`. Do NOT distinguish "user not found" from "wrong password" — same error for both (prevents username enumeration).
+
+**Session:** unchanged — UUID token in `X-Session-Id` header for all post-auth requests.
+
+---
+
 ### `server/requirements.txt`
 ```
 fastapi
 uvicorn
+passlib[bcrypt]
 ```
 
 ### `server/store.py`
 ```python
 import threading, uuid, time
+from passlib.context import CryptContext
+
+pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 class Store:
     def __init__(self):
         self._lock = threading.Lock()
-        self._users = {}     # username → {userId, sessionId}
+        self._users = {}     # username → {userId, username, passwordHash, sessionId}
         self._sessions = {}  # sessionId → username
         self._messages = []  # append-only
 
-    def login(self, username: str) -> dict:
+    def register(self, username: str, password: str) -> dict:
+        """Returns user dict or raises ValueError('username_taken')."""
         with self._lock:
-            session_id = str(uuid.uuid4())
             if username in self._users:
-                self._sessions.pop(self._users[username]["sessionId"], None)
-                self._users[username]["sessionId"] = session_id
-            else:
-                self._users[username] = {
-                    "userId": str(uuid.uuid4()),
-                    "username": username,
-                    "sessionId": session_id
-                }
+                raise ValueError("username_taken")
+            user_id = str(uuid.uuid4())
+            self._users[username] = {
+                "userId": user_id,
+                "username": username,
+                "passwordHash": pwd_ctx.hash(password),
+                "sessionId": None,
+            }
+            return {"userId": user_id, "username": username}
+
+    def login(self, username: str, password: str) -> dict:
+        """Returns {userId, username, sessionId} or raises ValueError('invalid_credentials')."""
+        with self._lock:
+            user = self._users.get(username)
+            if not user or not pwd_ctx.verify(password, user["passwordHash"]):
+                raise ValueError("invalid_credentials")
+            # Invalidate old session
+            if user["sessionId"]:
+                self._sessions.pop(user["sessionId"], None)
+            session_id = str(uuid.uuid4())
+            user["sessionId"] = session_id
             self._sessions[session_id] = username
-            return dict(self._users[username])
+            return {"userId": user["userId"], "username": username, "sessionId": session_id}
 
     def get_user_by_session(self, session_id: str) -> str | None:
         return self._sessions.get(session_id)
@@ -115,8 +148,13 @@ from store import store
 
 app = FastAPI()
 
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
 class LoginRequest(BaseModel):
     username: str
+    password: str
 
 class SendRequest(BaseModel):
     to: str
@@ -130,9 +168,21 @@ def auth(session_id: str | None) -> str:
         raise HTTPException(401, "Invalid session")
     return user
 
+@app.post("/register", status_code=201)
+def register(req: RegisterRequest):
+    try:
+        return store.register(req.username, req.password)
+    except ValueError as e:
+        if str(e) == "username_taken":
+            raise HTTPException(409, {"error": "username_taken"})
+        raise
+
 @app.post("/login")
 def login(req: LoginRequest):
-    return store.login(req.username)
+    try:
+        return store.login(req.username, req.password)
+    except ValueError:
+        raise HTTPException(401, {"error": "invalid_credentials"})
 
 @app.post("/send")
 def send(req: SendRequest, x_session_id: str | None = Header(None)):
@@ -154,20 +204,32 @@ def logout(x_session_id: str | None = Header(None)):
 
 ### Smoke test
 ```bash
-cd server && pip install -r requirements.txt
-uvicorn main:app --port 8765 &
+cd server && pip3 install -r requirements.txt
+python3 -m uvicorn main:app --port 8765 &
 
-# All three must return valid JSON
+# Register alice (201)
+curl -s -X POST localhost:8765/register \
+  -H "Content-Type: application/json" -d '{"username":"alice","password":"secret"}'
+
+# Register alice again → 409 username_taken
+curl -s -X POST localhost:8765/register \
+  -H "Content-Type: application/json" -d '{"username":"alice","password":"other"}'
+
+# Login with wrong password → 401
 curl -s -X POST localhost:8765/login \
-  -H "Content-Type: application/json" -d '{"username":"alice"}'
+  -H "Content-Type: application/json" -d '{"username":"alice","password":"wrong"}'
 
-# Copy sessionId from above, replace SESSION below
+# Login correctly (copy sessionId)
+SESSION=$(curl -s -X POST localhost:8765/login \
+  -H "Content-Type: application/json" -d '{"username":"alice","password":"secret"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['sessionId'])")
+
 curl -s -X POST localhost:8765/send \
   -H "Content-Type: application/json" \
-  -H "X-Session-Id: SESSION" \
+  -H "X-Session-Id: $SESSION" \
   -d '{"to":"bob","text":"hello"}'
 
-curl -s "localhost:8765/messages?since=0" -H "X-Session-Id: SESSION"
+curl -s "localhost:8765/messages?since=0" -H "X-Session-Id: $SESSION"
 ```
 
 ```bash
@@ -193,13 +255,27 @@ Authentication: every request except /login carries header `X-Session-Id: <sessi
 
 ## 2. API Endpoints
 
+### POST /register
+Request:
+  { "username": "alice", "password": "secret" }
+Response 201:
+  { "userId": "uuid", "username": "alice" }
+Response 409:
+  { "error": "username_taken" }
+Notes:
+  - Username must be unique. Client must show an error and let the user pick another.
+  - Password is validated on the server; plaintext is never stored (bcrypt hashed).
+
 ### POST /login
 Request:
-  { "username": "alice" }
+  { "username": "alice", "password": "secret" }
 Response 200:
   { "userId": "uuid", "username": "alice", "sessionId": "uuid" }
+Response 401:
+  { "error": "invalid_credentials" }
 Notes:
-  - Username collision is NOT an error. Re-login creates a new session for same user.
+  - Returns the same 401 for "user not found" and "wrong password" (no enumeration).
+  - Re-login invalidates the previous session and issues a new sessionId.
   - Client stores sessionId in memory for the session lifetime.
 
 ### POST /send
@@ -269,6 +345,7 @@ Server-assigned id is stored in serverId only after ACK.
 
 ```
 LOGGED_OUT   — no session
+REGISTERING  — POST /register in flight
 LOGGING_IN   — POST /login in flight
 ONLINE       — session active, sync loop running every 3 seconds
 FLUSHING     — session active, draining offline queue
@@ -280,19 +357,24 @@ OFFLINE      — session saved, no network
 ## 5. State Transitions
 
 ```
-LOGGED_OUT  + login()                → LOGGING_IN
-LOGGING_IN  + 200 response           → ONLINE (start sync loop)
-LOGGING_IN  + error                  → LOGGED_OUT
-ONLINE      + network lost           → OFFLINE (stop sync loop)
-ONLINE      + user sends message     → ONLINE (queue + immediate POST /send)
-ONLINE      + POST /send fails       → FLUSHING (message stays pending in queue)
-FLUSHING    + queue drained          → ONLINE (restart sync loop)
-FLUSHING    + network lost           → OFFLINE
-FLUSHING    + user sends message     → FLUSHING (append to queue tail — no second flush)
-OFFLINE     + network restored       → FLUSHING (if queue non-empty) or ONLINE
-OFFLINE     + user sends message     → OFFLINE (queue locally, status=pending)
-ANY         + 401 response           → LOGGED_OUT (keep queue, clear sessionId)
-ONLINE      + logout()               → LOGGED_OUT (POST /logout best-effort)
+LOGGED_OUT   + register()             → REGISTERING
+REGISTERING  + 201 response           → LOGGED_OUT (prompt user to login)
+REGISTERING  + 409 username_taken     → LOGGED_OUT (show error: pick another username)
+REGISTERING  + network error          → LOGGED_OUT (show error: try again)
+LOGGED_OUT   + login()                → LOGGING_IN
+LOGGING_IN   + 200 response           → ONLINE (start sync loop)
+LOGGING_IN   + 401 invalid_creds      → LOGGED_OUT (show error: wrong username/password)
+LOGGING_IN   + network error          → LOGGED_OUT (show error: try again)
+ONLINE       + network lost           → OFFLINE (stop sync loop)
+ONLINE       + user sends message     → ONLINE (queue + immediate POST /send)
+ONLINE       + POST /send fails       → FLUSHING (message stays pending in queue)
+FLUSHING     + queue drained          → ONLINE (restart sync loop)
+FLUSHING     + network lost           → OFFLINE
+FLUSHING     + user sends message     → FLUSHING (append to queue tail — no second flush)
+OFFLINE      + network restored       → FLUSHING (if queue non-empty) or ONLINE
+OFFLINE      + user sends message     → OFFLINE (queue locally, status=pending)
+ANY          + 401 response           → LOGGED_OUT (keep queue, clear sessionId)
+ONLINE       + logout()               → LOGGED_OUT (POST /logout best-effort)
 ```
 
 ---
@@ -394,14 +476,26 @@ Accept --offline and --online commands on stdin to simulate connectivity changes
 ## 10. Behavioral Test Scenarios
 
 ### Scenario A: Basic send/receive
-1. Alice logs in
-2. Bob logs in
-3. Alice sends "Hi Bob" to bob
-4. Bob polls → receives message from alice
+1. Alice registers (201)
+2. Bob registers (201)
+3. Alice logs in → session
+4. Bob logs in → session
+5. Alice sends "Hi Bob" to bob
+6. Bob polls → receives message from alice
 PASS: message appears, from=alice, text="Hi Bob"
 
+### Scenario A2: Duplicate username rejected
+1. Alice registers with username "alice" (201)
+2. Alice tries to register again with same username → 409
+PASS: second registration returns username_taken error
+
+### Scenario A3: Wrong password rejected
+1. Alice registers (201)
+2. Alice logs in with wrong password → 401 invalid_credentials
+PASS: login fails with correct error
+
 ### Scenario B: Offline queue FIFO
-1. Alice logs in
+1. Alice registers + logs in
 2. Alice goes offline
 3. Alice sends "Message 1" and "Message 2"
 4. Bob polls → receives nothing (Alice is offline)
@@ -411,7 +505,7 @@ PASS: message appears, from=alice, text="Hi Bob"
 PASS: both received, Message 1 before Message 2
 
 ### Scenario C: Full Alice/Bob cross-platform
-1.  Alice (Swift) logs in; Bob (Kotlin) logs in
+1.  Alice (Swift) registers + logs in; Bob (Kotlin) registers + logs in
 2.  Alice sends "Hi Bob, I have something important to tell you"
 3.  Bob polls → receives Alice's message
 4.  Bob sends "What is it?"
@@ -565,17 +659,19 @@ Each file must begin with exactly this line (so the harness can extract it):
 **Models.swift** — Codable structs:
 - `WireMessage`: id, from, to, text, timestamp, status
 - `QueuedMessage`: localId, serverId (optional), toUser, text, queuedAt, status enum
+- `RegisterResponse`: userId, username
 - `LoginResponse`: userId, username, sessionId
 - `SendResponse`: id, timestamp
 - `MessagesResponse`: messages array, serverTimestamp
 
 **NetworkClient.swift** — URLSession wrapper:
-- `func login(username: String, serverURL: String) async throws -> LoginResponse`
+- `func register(username: String, password: String, serverURL: String) async throws -> RegisterResponse`
+- `func login(username: String, password: String, serverURL: String) async throws -> LoginResponse`
 - `func send(to: String, text: String, sessionId: String, serverURL: String) async throws -> SendResponse`
 - `func getMessages(since: Int64, sessionId: String, serverURL: String) async throws -> MessagesResponse`
 - `func logout(sessionId: String, serverURL: String) async`
 - All requests set Content-Type: application/json and X-Session-Id header where required
-- Throw a typed NetworkError (unauthorized, serverError, connectionFailed)
+- Throw a typed NetworkError (unauthorized, usernameTaken, serverError, connectionFailed)
 
 **OfflineQueue.swift** — SQLite.swift backed queue:
 - Open/create database at `~/.messaging-cli/queue.db`
@@ -595,32 +691,36 @@ Each file must begin with exactly this line (so the harness can extract it):
 - Start monitoring on init
 
 **MessageClient.swift** — state machine + orchestrator:
-- Implement all 5 states: loggedOut, loggingIn, online, flushing, offline
+- Implement all 6 states: loggedOut, registering, loggingIn, online, flushing, offline
 - Sync loop: poll every 3 seconds when online
 - Flush loop: run flushQueue() algorithm from spec exactly
 - On transition offline→online: immediate poll before waiting 3s
-- `func login(username: String) async`
+- `func register(username: String, password: String) async`
+- `func login(username: String, password: String) async`
 - `func sendMessage(to: String, text: String) async`
 - `func logout() async`
 - `var onMessageReceived: ((WireMessage) -> Void)?`
 - `var onStateChange: ((String) -> Void)?`
+- `var onError: ((String) -> Void)?` — surface username_taken, invalid_credentials to UI
 
 **main.swift** — CLI entry point:
-- Args: `--user <name>` (required), `--server <url>` (default: http://localhost:8765)
-- After login, enter a read loop on stdin
-- Commands:
+- Args: `--user <name>`, `--password <pass>`, `--server <url>` (default: http://localhost:8765)
+- If `--user` and `--password` not given, prompt interactively on stdin
+- First prompt: `register` or `login`? Then ask username + password
+- Commands after login:
   - `send <username> <message text>` — send a message
-  - `offline` — simulate going offline (stop network calls, set isOnline=false)
+  - `offline` — simulate going offline
   - `online` — simulate coming back online
   - `quit` — logout and exit
 - Print received messages as: `RECEIVED from <username>: <text>`
 - Print state changes as: `STATE: <state>`
+- Print errors as: `ERROR: <reason>` (e.g. username_taken, invalid_credentials)
 
 ## Requirements
 - No chat or messaging SDKs
 - No Combine, no SwiftUI
 - All network calls must handle URLError.notConnectedToInternet as connectionFailed
-- The binary must work: `swift run messaging-cli --user alice`
+- The binary must work: `swift run messaging-cli --user alice --password secret`
 ````
 
 ### `generator/prompts/kotlin_prompt.md`
@@ -653,6 +753,7 @@ Each file must begin with exactly this line:
 **Models.kt** — @Serializable data classes:
 - `WireMessage`: id, from, to, text, timestamp, status
 - `QueuedMessage`: localId, serverId (nullable), toUser, text, queuedAt, status (enum)
+- `RegisterResponse`: userId, username
 - `LoginResponse`: userId, username, sessionId
 - `SendResponse`: id, timestamp
 - `MessagesResponse`: messages, serverTimestamp
@@ -660,11 +761,12 @@ Each file must begin with exactly this line:
 
 **NetworkClient.kt** — OkHttp wrapper:
 - All methods are suspend functions
-- `suspend fun login(username: String, serverURL: String): LoginResponse`
+- `suspend fun register(username: String, password: String, serverURL: String): RegisterResponse`
+- `suspend fun login(username: String, password: String, serverURL: String): LoginResponse`
 - `suspend fun send(to: String, text: String, sessionId: String, serverURL: String): SendResponse`
 - `suspend fun getMessages(since: Long, sessionId: String, serverURL: String): MessagesResponse`
 - `suspend fun logout(sessionId: String, serverURL: String)`
-- Throw sealed class NetworkError: Unauthorized, ServerError, ConnectionFailed
+- Throw sealed class NetworkError: Unauthorized, UsernameTaken, ServerError, ConnectionFailed
 
 **OfflineQueue.kt** — Exposed + SQLite:
 - Database file: `~/.messaging-cli/queue.db`
@@ -684,26 +786,29 @@ Each file must begin with exactly this line:
 - `var onStatusChange: ((Boolean) -> Unit)? = null`
 
 **MessageClient.kt** — state machine + coroutine orchestrator:
-- Implement all 5 states as a sealed class or enum
+- Implement all 6 states as a sealed class or enum: LOGGED_OUT, REGISTERING, LOGGING_IN, ONLINE, FLUSHING, OFFLINE
 - Sync loop: launch coroutine polling every 3 seconds when ONLINE
 - Flush loop: run flushQueue algorithm from spec, as a coroutine
-- `suspend fun login(username: String)`
+- `suspend fun register(username: String, password: String)`
+- `suspend fun login(username: String, password: String)`
 - `suspend fun sendMessage(to: String, text: String)`
 - `suspend fun logout()`
 - `var onMessageReceived: ((WireMessage) -> Unit)? = null`
 - `var onStateChange: ((String) -> Unit)? = null`
+- `var onError: ((String) -> Unit)? = null` — surface username_taken, invalid_credentials
 
 **Main.kt** — CLI entry point:
-- Args: `--user <name>` (required), `--server <url>` (default: http://localhost:8765)
+- Args: `--user <name>`, `--password <pass>`, `--server <url>` (default: http://localhost:8765)
+- If args not provided, prompt interactively: `register` or `login`? then username + password
 - Read stdin in a loop after login
 - Commands: `send <username> <message>`, `offline`, `online`, `quit`
-- Print: `RECEIVED from <username>: <text>` and `STATE: <state>`
+- Print: `RECEIVED from <username>: <text>`, `STATE: <state>`, `ERROR: <reason>`
 - Use `runBlocking` + coroutines
 
 ## Requirements
 - No chat or messaging SDKs
 - Handle java.net.ConnectException as ConnectionFailed (→ offline)
-- Must run: `./gradlew run --args="--user bob"`
+- Must run: `./gradlew run --args="--user bob --password secret"`
 ````
 
 ```bash
