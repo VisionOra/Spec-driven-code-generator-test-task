@@ -44,11 +44,12 @@ swift build -c release  # Release build
 cd clients/kotlin
 ./gradlew build                # Full build (compile + tests)
 
-# Register & login
-./gradlew run --args "--user alice --password secret"
+# Register & login (note: args must be in quotes)
+./gradlew run --args='--user alice --password secret'
 
 # Or run the JAR directly
-java -jar build/libs/messaging-cli-1.0-all.jar --user alice --password secret
+./gradlew jar  # Build the JAR first
+java -jar build/libs/messaging-cli-1.0.jar --user alice --password secret
 ```
 
 ### Messaging Commands
