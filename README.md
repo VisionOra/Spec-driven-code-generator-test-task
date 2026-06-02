@@ -33,7 +33,7 @@ swift build              # Debug build
 swift build -c release  # Release build
 
 # With credentials (auto-registers if user doesn't exist)
-.build/debug/messaging-cli --user alice --password secret
+.build/debug/messaging-cli --user ben --password ben
 
 # Interactive mode
 .build/debug/messaging-cli
@@ -45,7 +45,7 @@ cd clients/kotlin
 ./gradlew build    # Compile + check
 
 # Run via Gradle (stdin is wired — interactive prompts work)
-./gradlew run --args='--user alice --password secret'
+./gradlew run --args='--user kein --password kein'
 
 # Interactive mode (no credentials — prompts for register or login)
 ./gradlew run
