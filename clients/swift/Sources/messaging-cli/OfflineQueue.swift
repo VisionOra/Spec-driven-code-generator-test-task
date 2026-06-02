@@ -12,9 +12,11 @@ class OfflineQueue {
     private let colQueuedAt = Expression<Int64>("queued_at")
     private let colStatus = Expression<String>("status")
 
-    init() {
+    // username-scoped so two users on the same machine don't share a queue DB
+    init(username: String) {
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".messaging-cli")
+            .appendingPathComponent(username)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let dbPath = dir.appendingPathComponent("queue.db").path
         db = try! Connection(dbPath)

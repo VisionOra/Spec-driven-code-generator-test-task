@@ -63,6 +63,45 @@ Header: X-Session-Id: <sessionId>
 Response 200: {}
 Notes: Best-effort. Client clears session regardless of response.
 
+### GET /inbox
+Header: X-Session-Id: <sessionId>
+Response 200:
+  {
+    "inbox": [
+      { "contact": "bob", "unread": 3, "lastTimestamp": 1234567890000 },
+      { "contact": "charlie", "unread": 0, "lastTimestamp": 1234567880000 }
+    ]
+  }
+Notes:
+  - Returns all contacts who have sent messages to the authenticated user.
+  - Sorted by lastTimestamp DESC (most recent conversation first).
+  - unread = count of messages from that contact not yet marked read.
+  - Client shows this immediately after login and refreshes on new message.
+
+### GET /conversation/<username>
+Header: X-Session-Id: <sessionId>
+Response 200:
+  {
+    "messages": [
+      { "id": "uuid", "from_user": "bob", "to_user": "alice",
+        "text": "hi", "timestamp": 1234567890000, "read": 0 }
+    ]
+  }
+Notes:
+  - Returns ALL messages between authenticated user and <username>, both directions.
+  - Ordered by timestamp ASC (oldest first — render as a chat stack top to bottom).
+  - Client calls this when user opens a conversation.
+
+### POST /mark-read
+Header: X-Session-Id: <sessionId>
+Request:
+  { "fromUser": "bob" }
+Response 200: {}
+Notes:
+  - Marks all messages FROM <fromUser> TO the authenticated user as read.
+  - Call this when the user opens a conversation.
+  - After this, GET /inbox returns unread=0 for that contact.
+
 ---
 
 ## 3. Data Models

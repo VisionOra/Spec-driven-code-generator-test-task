@@ -16,7 +16,7 @@ actor MessageClient {
     var onError: ((String) -> Void)?
 
     private let network = NetworkClient()
-    private let queue = OfflineQueue()
+    private var queue: OfflineQueue?   // created after login with username-scoped path
     private var state: State = .loggedOut
     private var sessionId: String?
     private var currentUser: String?
@@ -49,7 +49,7 @@ actor MessageClient {
     private func handleNetworkChange(isOnline: Bool) async {
         if isOnline {
             guard state == .offline else { return }
-            if queue.nextPending() != nil {
+            if queue?.nextPending() != nil {
                 await transition(to: .flushing)
                 await flushQueue()
             } else {
@@ -65,67 +65,81 @@ actor MessageClient {
         }
     }
 
-    func register(username: String, password: String) async {
-        guard state == .loggedOut else { return }
+    func register(username: String, password: String) async -> Bool {
+        guard state == .loggedOut else { return false }
         await transition(to: .registering)
         do {
             _ = try await network.register(username: username, password: password, serverURL: serverURL)
             await transition(to: .loggedOut)
+            return true
         } catch NetworkError.usernameTaken {
             onError?("username_taken")
             await transition(to: .loggedOut)
-        } catch {
-            onError?("registration_failed: \(error)")
+            return false
+        } catch NetworkError.connectionFailed {
+            onError?("Cannot reach server. Make sure the server is running on \(serverURL)")
             await transition(to: .loggedOut)
+            return false
+        } catch {
+            onError?("Registration failed: \(error.localizedDescription)")
+            await transition(to: .loggedOut)
+            return false
         }
     }
 
-    func login(username: String, password: String) async {
-        guard state == .loggedOut else { return }
+    func login(username: String, password: String) async -> Bool {
+        guard state == .loggedOut else { return false }
         await transition(to: .loggingIn)
         do {
             let resp = try await network.login(username: username, password: password, serverURL: serverURL)
             sessionId = resp.sessionId
             currentUser = resp.username
+            queue = OfflineQueue(username: resp.username)  // user-scoped DB
             await transition(to: .online)
             startSyncLoop(immediate: true)
+            return true
         } catch NetworkError.unauthorized {
-            onError?("invalid_credentials")
+            onError?("Wrong username or password.")
             await transition(to: .loggedOut)
+            return false
+        } catch NetworkError.connectionFailed {
+            onError?("Cannot reach server. Make sure the server is running on \(serverURL)")
+            await transition(to: .loggedOut)
+            return false
         } catch {
-            onError?("login_failed: \(error)")
+            onError?("Login failed: \(error.localizedDescription)")
             await transition(to: .loggedOut)
+            return false
         }
     }
 
     func sendMessage(to: String, text: String) async {
-        let localId = queue.enqueue(to: to, text: text)
+        guard let q = queue else { return }
+        let localId = q.enqueue(to: to, text: text)
 
         switch state {
         case .online:
             guard let sid = sessionId else { return }
-            queue.markSending(localId: localId)
+            q.markSending(localId: localId)
             do {
                 let resp = try await network.send(to: to, text: text, sessionId: sid, serverURL: serverURL)
-                queue.markSent(localId: localId, serverId: resp.id)
+                q.markSent(localId: localId, serverId: resp.id)
             } catch NetworkError.unauthorized {
-                queue.markPending(localId: localId)
+                q.markPending(localId: localId)
                 await handleUnauthorized()
             } catch NetworkError.connectionFailed {
-                queue.markPending(localId: localId)
+                q.markPending(localId: localId)
                 syncTask?.cancel()
                 syncTask = nil
-                await transition(to: .flushing)
                 await transition(to: .offline)
             } catch {
-                queue.markPending(localId: localId)
+                q.markPending(localId: localId)
                 syncTask?.cancel()
                 syncTask = nil
                 await transition(to: .flushing)
                 await flushQueue()
             }
         case .flushing, .offline:
-            // Already queued above; nothing else to do
             break
         default:
             break
@@ -168,7 +182,7 @@ actor MessageClient {
             let resp = try await network.getMessages(since: lastServerTimestamp, sessionId: sid, serverURL: serverURL)
             lastServerTimestamp = resp.serverTimestamp
             for msg in resp.messages {
-                if let serverId = msg.id as String?, queue.isDuplicate(serverId: serverId) { continue }
+                if queue?.isDuplicate(serverId: msg.id) == true { continue }
                 onMessageReceived?(msg)
             }
         } catch NetworkError.unauthorized {
@@ -183,35 +197,32 @@ actor MessageClient {
     }
 
     private func flushQueue() async {
-        guard state == .flushing, let sid = sessionId else { return }
+        guard state == .flushing, let sid = sessionId, let q = queue else { return }
 
         while true {
-            guard let msg = queue.nextPending() else {
-                // Queue drained
+            guard let msg = q.nextPending() else {
                 await transition(to: .online)
                 startSyncLoop(immediate: true)
                 return
             }
 
-            queue.markSending(localId: msg.localId)
+            q.markSending(localId: msg.localId)
 
             do {
                 let resp = try await network.send(to: msg.toUser, text: msg.text, sessionId: sid, serverURL: serverURL)
-                queue.markSent(localId: msg.localId, serverId: resp.id)
+                q.markSent(localId: msg.localId, serverId: resp.id)
             } catch NetworkError.unauthorized {
-                queue.markPending(localId: msg.localId)
+                q.markPending(localId: msg.localId)
                 await handleUnauthorized()
                 return
             } catch NetworkError.connectionFailed {
-                queue.markPending(localId: msg.localId)
+                q.markPending(localId: msg.localId)
                 await transition(to: .offline)
                 return
             } catch NetworkError.serverError(let code) where code >= 500 {
-                queue.markFailed(localId: msg.localId)
-                // continue to next message
+                q.markFailed(localId: msg.localId)
             } catch {
-                queue.markFailed(localId: msg.localId)
-                // continue to next message
+                q.markFailed(localId: msg.localId)
             }
         }
     }

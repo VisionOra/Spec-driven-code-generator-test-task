@@ -4,11 +4,42 @@
 
 ## What You're Building
 
-- **Python server** — minimal FastAPI, in-memory, hand-written
+- **Python server** — FastAPI + SQLite persistence, hand-written
 - **Swift CLI client** — macOS terminal binary, generated from spec
 - **Kotlin JVM client** — terminal binary, generated from spec
 - **Generator harness** — Python script that calls Claude Code and compile-checks output
 - **Spec** — single Markdown file that drives both clients
+
+### CLI UX (what the user sees)
+
+```
+=== Inbox ===
+  bob   3 unread
+  charlie 0 unread
+open <user> | send <user> <msg> | quit
+> open bob
+
+=== bob ===
+  [10:30]  bob: hi there
+  [10:31]    you: hello!
+  [10:32]  bob: how are you?
+─────────────────────────────────────
+send <msg> | back | quit
+> hey good thanks
+
+  [10:33]    you: hey good thanks
+
+send <msg> | back | quit
+>
+```
+
+Key rules:
+- After login: show inbox automatically (each contact + unread count)
+- `open <user>` — show full conversation history with that user; mark their messages as read
+- Inside a conversation: just type the message text to send (no `send` prefix needed)
+- `back` — return to inbox view
+- New messages arrive in real time (3-second poll) and refresh the current view
+- Inbox and messages are stored in SQLite on both server and client
 
 ---
 
@@ -51,19 +82,19 @@ git add . && git commit -m "feat: initial project structure"
 
 ## Step 2: Python Server
 
-### Auth design decisions (read before coding)
+### Design decisions
 
-**Registration vs login are separate operations:**
-- `POST /register` — creates a new account. Returns 409 if username already taken.
-- `POST /login` — authenticates an existing account with password. Returns 401 if wrong credentials.
+**Storage:** SQLite via Python's built-in `sqlite3` module. DB file at `~/.messaging-server/messages.db`.
+No extra dependencies — `bcrypt` is the only addition to requirements.
 
-**Password storage:** hash with `bcrypt` (never store plaintext). Use the `bcrypt` package directly (`bcrypt.hashpw` / `bcrypt.checkpw`).
+**Sessions:** UUID token, in-memory only. Users re-login after server restart (acceptable for a demo).
 
-**Duplicate username:** registration returns HTTP 409 Conflict with `{"error": "username_taken"}`. Clients must surface this to the user and prompt for a different name.
+**Auth:**
+- `POST /register` — 201 on success, 409 `username_taken` if duplicate
+- `POST /login` — 200 on success, 401 `invalid_credentials` for wrong password OR unknown user
+- Passwords stored as bcrypt hashes (never plaintext)
 
-**Wrong password at login:** returns HTTP 401 with `{"error": "invalid_credentials"}`. Do NOT distinguish "user not found" from "wrong password" — same error for both (prevents username enumeration).
-
-**Session:** unchanged — UUID token in `X-Session-Id` header for all post-auth requests.
+**Read tracking:** messages have a `read` flag (0/1). Marking read is per-recipient.
 
 ---
 
@@ -74,66 +105,133 @@ uvicorn
 bcrypt
 ```
 
+### SQLite schema (`~/.messaging-server/messages.db`)
+```sql
+CREATE TABLE IF NOT EXISTS users (
+    user_id      TEXT PRIMARY KEY,
+    username     TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id         TEXT PRIMARY KEY,
+    from_user  TEXT NOT NULL,
+    to_user    TEXT NOT NULL,
+    text       TEXT NOT NULL,
+    timestamp  INTEGER NOT NULL,
+    read       INTEGER NOT NULL DEFAULT 0
+);
+```
+
 ### `server/store.py`
 ```python
-import threading, uuid, time
+import sqlite3, threading, uuid, time, os
 import bcrypt
+
+DB_PATH = os.path.expanduser("~/.messaging-server/messages.db")
+
+def _conn():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id       TEXT PRIMARY KEY,
+            username      TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            id        TEXT PRIMARY KEY,
+            from_user TEXT NOT NULL,
+            to_user   TEXT NOT NULL,
+            text      TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            read      INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    return con
 
 class Store:
     def __init__(self):
         self._lock = threading.Lock()
-        self._users = {}     # username → {userId, username, passwordHash, sessionId}
-        self._sessions = {}  # sessionId → username
-        self._messages = []  # append-only
+        self._db = _conn()
+        self._sessions = {}  # sessionId → username (in-memory only)
+
+    def _execute(self, sql, params=()):
+        with self._lock:
+            cur = self._db.execute(sql, params)
+            self._db.commit()
+            return cur
 
     def register(self, username: str, password: str) -> dict:
-        """Returns user dict or raises ValueError('username_taken')."""
-        with self._lock:
-            if username in self._users:
-                raise ValueError("username_taken")
-            user_id = str(uuid.uuid4())
-            self._users[username] = {
-                "userId": user_id,
-                "username": username,
-                "passwordHash": bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(),
-                "sessionId": None,
-            }
-            return {"userId": user_id, "username": username}
+        existing = self._db.execute(
+            "SELECT user_id FROM users WHERE username=?", (username,)).fetchone()
+        if existing:
+            raise ValueError("username_taken")
+        user_id = str(uuid.uuid4())
+        pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        self._execute(
+            "INSERT INTO users(user_id, username, password_hash) VALUES(?,?,?)",
+            (user_id, username, pw_hash))
+        return {"userId": user_id, "username": username}
 
     def login(self, username: str, password: str) -> dict:
-        """Returns {userId, username, sessionId} or raises ValueError('invalid_credentials')."""
-        with self._lock:
-            user = self._users.get(username)
-            if not user or not bcrypt.checkpw(password.encode(), user["passwordHash"].encode()):
-                raise ValueError("invalid_credentials")
-            # Invalidate old session
-            if user["sessionId"]:
-                self._sessions.pop(user["sessionId"], None)
-            session_id = str(uuid.uuid4())
-            user["sessionId"] = session_id
-            self._sessions[session_id] = username
-            return {"userId": user["userId"], "username": username, "sessionId": session_id}
+        row = self._db.execute(
+            "SELECT user_id, password_hash FROM users WHERE username=?", (username,)).fetchone()
+        if not row or not bcrypt.checkpw(password.encode(), row["password_hash"].encode()):
+            raise ValueError("invalid_credentials")
+        session_id = str(uuid.uuid4())
+        self._sessions[session_id] = username
+        return {"userId": row["user_id"], "username": username, "sessionId": session_id}
+
+    def logout(self, session_id: str):
+        self._sessions.pop(session_id, None)
 
     def get_user_by_session(self, session_id: str) -> str | None:
         return self._sessions.get(session_id)
 
     def send_message(self, from_user: str, to: str, text: str) -> dict:
-        with self._lock:
-            msg = {
-                "id": str(uuid.uuid4()),
-                "from": from_user,
-                "to": to,
-                "text": text,
-                "timestamp": int(time.time() * 1000),
-                "status": "delivered"
-            }
-            self._messages.append(msg)
-            return msg
+        msg_id = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        self._execute(
+            "INSERT INTO messages(id, from_user, to_user, text, timestamp) VALUES(?,?,?,?,?)",
+            (msg_id, from_user, to, text, ts))
+        return {"id": msg_id, "from": from_user, "to": to,
+                "text": text, "timestamp": ts, "status": "delivered"}
 
     def get_messages(self, for_user: str, since: int = 0) -> list:
-        with self._lock:
-            return [m for m in self._messages
-                    if m["to"] == for_user and m["timestamp"] > since]
+        rows = self._db.execute(
+            "SELECT * FROM messages WHERE to_user=? AND timestamp>? ORDER BY timestamp ASC",
+            (for_user, since)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_inbox(self, for_user: str) -> list:
+        """Returns [{contact, unread_count, last_timestamp}] sorted by last_timestamp DESC."""
+        rows = self._db.execute("""
+            SELECT from_user AS contact,
+                   SUM(CASE WHEN read=0 THEN 1 ELSE 0 END) AS unread,
+                   MAX(timestamp) AS last_ts
+            FROM messages WHERE to_user=?
+            GROUP BY from_user
+            ORDER BY last_ts DESC
+        """, (for_user,)).fetchall()
+        return [{"contact": r["contact"], "unread": r["unread"], "lastTimestamp": r["last_ts"]}
+                for r in rows]
+
+    def get_conversation(self, user_a: str, user_b: str) -> list:
+        """Returns all messages between user_a and user_b ordered by timestamp ASC."""
+        rows = self._db.execute("""
+            SELECT * FROM messages
+            WHERE (from_user=? AND to_user=?) OR (from_user=? AND to_user=?)
+            ORDER BY timestamp ASC
+        """, (user_a, user_b, user_b, user_a)).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_read(self, from_user: str, to_user: str):
+        """Mark all messages from from_user to to_user as read."""
+        self._execute(
+            "UPDATE messages SET read=1 WHERE from_user=? AND to_user=? AND read=0",
+            (from_user, to_user))
 
 store = Store()
 ```
@@ -143,6 +241,7 @@ store = Store()
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from store import store
+import time
 
 app = FastAPI()
 
@@ -157,6 +256,9 @@ class LoginRequest(BaseModel):
 class SendRequest(BaseModel):
     to: str
     text: str
+
+class MarkReadRequest(BaseModel):
+    fromUser: str
 
 def auth(session_id: str | None) -> str:
     if not session_id:
@@ -182,6 +284,12 @@ def login(req: LoginRequest):
     except ValueError:
         raise HTTPException(401, {"error": "invalid_credentials"})
 
+@app.post("/logout")
+def logout(x_session_id: str | None = Header(None)):
+    if x_session_id:
+        store.logout(x_session_id)
+    return {}
+
 @app.post("/send")
 def send(req: SendRequest, x_session_id: str | None = Header(None)):
     username = auth(x_session_id)
@@ -191,47 +299,57 @@ def send(req: SendRequest, x_session_id: str | None = Header(None)):
 def messages(since: int = 0, x_session_id: str | None = Header(None)):
     username = auth(x_session_id)
     msgs = store.get_messages(username, since)
-    server_ts = int(__import__("time").time() * 1000)
-    return {"messages": msgs, "serverTimestamp": server_ts}
+    return {"messages": msgs, "serverTimestamp": int(time.time() * 1000)}
 
-@app.post("/logout")
-def logout(x_session_id: str | None = Header(None)):
-    auth(x_session_id)
+@app.get("/inbox")
+def inbox(x_session_id: str | None = Header(None)):
+    username = auth(x_session_id)
+    return {"inbox": store.get_inbox(username)}
+
+@app.get("/conversation/{other_user}")
+def conversation(other_user: str, x_session_id: str | None = Header(None)):
+    username = auth(x_session_id)
+    msgs = store.get_conversation(username, other_user)
+    return {"messages": msgs}
+
+@app.post("/mark-read")
+def mark_read(req: MarkReadRequest, x_session_id: str | None = Header(None)):
+    username = auth(x_session_id)
+    store.mark_read(req.fromUser, username)
     return {}
 ```
 
 ### Smoke test
 ```bash
 cd server && pip3 install -r requirements.txt
-python3 -m uvicorn main:app --port 8765 &
+python3 -m uvicorn main:app --port 8765
 
-# Register alice (201)
-curl -s -X POST localhost:8765/register \
-  -H "Content-Type: application/json" -d '{"username":"alice","password":"secret"}'
+# Register
+curl -s -X POST localhost:8765/register -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"secret"}'
+curl -s -X POST localhost:8765/register -H "Content-Type: application/json" \
+  -d '{"username":"bob","password":"pass"}'
 
-# Register alice again → 409 username_taken
-curl -s -X POST localhost:8765/register \
-  -H "Content-Type: application/json" -d '{"username":"alice","password":"other"}'
+# Login as alice
+SESSION=$(curl -s -X POST localhost:8765/login -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"secret"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['sessionId'])")
 
-# Login with wrong password → 401
-curl -s -X POST localhost:8765/login \
-  -H "Content-Type: application/json" -d '{"username":"alice","password":"wrong"}'
+# alice sends to bob
+curl -s -X POST localhost:8765/send -H "Content-Type: application/json" \
+  -H "X-Session-Id: $SESSION" -d '{"to":"bob","text":"hi bob"}'
 
-# Login correctly (copy sessionId)
-SESSION=$(curl -s -X POST localhost:8765/login \
-  -H "Content-Type: application/json" -d '{"username":"alice","password":"secret"}' \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['sessionId'])")
-
-curl -s -X POST localhost:8765/send \
-  -H "Content-Type: application/json" \
-  -H "X-Session-Id: $SESSION" \
-  -d '{"to":"bob","text":"hello"}'
-
-curl -s "localhost:8765/messages?since=0" -H "X-Session-Id: $SESSION"
+# Login as bob, check inbox, open conversation
+BOB=$(curl -s -X POST localhost:8765/login -H "Content-Type: application/json" \
+  -d '{"username":"bob","password":"pass"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['sessionId'])")
+curl -s localhost:8765/inbox -H "X-Session-Id: $BOB"
+curl -s localhost:8765/conversation/alice -H "X-Session-Id: $BOB"
+curl -s -X POST localhost:8765/mark-read -H "Content-Type: application/json" \
+  -H "X-Session-Id: $BOB" -d '{"fromUser":"alice"}'
+curl -s localhost:8765/inbox -H "X-Session-Id: $BOB"   # unread should be 0
 ```
 
 ```bash
-git add server/ && git commit -m "feat: add Python server with in-memory store"
+git add server/ && git commit -m "feat: server with SQLite persistence, inbox, conversation, mark-read"
 ```
 
 ---
@@ -305,6 +423,41 @@ Notes:
 Header: X-Session-Id: <sessionId>
 Response 200: {}
 Notes: Best-effort. Client clears session regardless of response.
+
+### GET /inbox
+Header: X-Session-Id: <sessionId>
+Response 200:
+  {
+    "inbox": [
+      { "contact": "alice", "unread": 3, "lastTimestamp": 1234567890000 },
+      { "contact": "charlie", "unread": 0, "lastTimestamp": 1234567880000 }
+    ]
+  }
+Notes:
+  - Sorted by lastTimestamp DESC (most recent conversation first).
+  - Client shows this on login and refreshes it when new messages arrive.
+
+### GET /conversation/<username>
+Header: X-Session-Id: <sessionId>
+Response 200:
+  {
+    "messages": [
+      { "id": "uuid", "from_user": "alice", "to_user": "bob",
+        "text": "hi", "timestamp": 1234567890000, "read": 0 }
+    ]
+  }
+Notes:
+  - Returns ALL messages between the authenticated user and <username>, both directions.
+  - Ordered by timestamp ASC (oldest first — display as a chat stack).
+
+### POST /mark-read
+Header: X-Session-Id: <sessionId>
+Request:
+  { "fromUser": "alice" }
+Response 200: {}
+Notes:
+  - Marks all messages FROM <fromUser> TO the authenticated user as read.
+  - Call this when the user opens a conversation.
 
 ---
 
@@ -655,64 +808,87 @@ Each file must begin with exactly this line (so the harness can extract it):
 ## Files to generate
 
 **Models.swift** — Codable structs:
-- `WireMessage`: id, from, to, text, timestamp, status
-- `QueuedMessage`: localId, serverId (optional), toUser, text, queuedAt, status enum
+- `WireMessage`: id, fromUser (CodingKey "from"), to, text, timestamp (Int64), status
+- `QueuedMessage`: localId, serverId (optional), toUser, text, queuedAt (Int64), status (QueuedStatus enum)
+- `QueuedStatus` enum: pending, sending, sent, failed
 - `RegisterResponse`: userId, username
 - `LoginResponse`: userId, username, sessionId
-- `SendResponse`: id, timestamp
-- `MessagesResponse`: messages array, serverTimestamp
+- `SendResponse`: id, timestamp (Int64)
+- `MessagesResponse`: messages ([WireMessage]), serverTimestamp (Int64)
+- `InboxEntry`: contact (String), unread (Int), lastTimestamp (Int64)
+- `InboxResponse`: inbox ([InboxEntry])
+- `ConversationMessage`: id, fromUser (CodingKey "from_user"), toUser (CodingKey "to_user"), text, timestamp (Int64), read (Int)
+- `ConversationResponse`: messages ([ConversationMessage])
 
 **NetworkClient.swift** — URLSession wrapper:
 - `func register(username: String, password: String, serverURL: String) async throws -> RegisterResponse`
 - `func login(username: String, password: String, serverURL: String) async throws -> LoginResponse`
 - `func send(to: String, text: String, sessionId: String, serverURL: String) async throws -> SendResponse`
 - `func getMessages(since: Int64, sessionId: String, serverURL: String) async throws -> MessagesResponse`
+- `func getInbox(sessionId: String, serverURL: String) async throws -> InboxResponse`
+- `func getConversation(with username: String, sessionId: String, serverURL: String) async throws -> ConversationResponse`
+- `func markRead(fromUser: String, sessionId: String, serverURL: String) async`
 - `func logout(sessionId: String, serverURL: String) async`
-- All requests set Content-Type: application/json and X-Session-Id header where required
 - Throw a typed NetworkError (unauthorized, usernameTaken, serverError, connectionFailed)
 
 **OfflineQueue.swift** — SQLite.swift backed queue:
-- Open/create database at `~/.messaging-cli/queue.db`
-- Create queued_messages table with schema from spec
-- `func enqueue(to: String, text: String) -> String` (returns localId)
-- `func nextPending() -> QueuedMessage?`
-- `func markSending(localId: String)`
-- `func markSent(localId: String, serverId: String)`
-- `func markFailed(localId: String)`
-- `func markPending(localId: String)`
-- `func isDuplicate(serverId: String) -> Bool`
+- Database path MUST be user-scoped: `~/.messaging-cli/<username>/queue.db`
+- `init(username: String)` — created AFTER login, not on MessageClient init
+- Reason: two users on the same machine share the filesystem; a shared queue DB causes `isDuplicate` to return true for the other user's sent messages, silently dropping all received messages
+- Open/create database at `~/.messaging-cli/<username>/queue.db`
+- `func enqueue(to: String, text: String) -> String`, `nextPending()`, `markSending/Sent/Failed/Pending`, `isDuplicate`
 
-**NetworkMonitor.swift** — NWPathMonitor wrapper:
-- `class NetworkMonitor`
-- `var isOnline: Bool`
-- `var onStatusChange: ((Bool) -> Void)?`
-- Start monitoring on init
+**NetworkMonitor.swift** — NWPathMonitor + CLI simulation (unchanged)
 
 **MessageClient.swift** — state machine + orchestrator:
-- Implement all 6 states: loggedOut, registering, loggingIn, online, flushing, offline
-- Sync loop: poll every 3 seconds when online
-- Flush loop: run flushQueue() algorithm from spec exactly
-- On transition offline→online: immediate poll before waiting 3s
-- `func register(username: String, password: String) async`
-- `func login(username: String, password: String) async`
+- 6 states: loggedOut, registering, loggingIn, online, flushing, offline
+- `func register(username: String, password: String) async -> Bool`
+- `func login(username: String, password: String) async -> Bool`
 - `func sendMessage(to: String, text: String) async`
 - `func logout() async`
-- `var onMessageReceived: ((WireMessage) -> Void)?`
+- `func fetchInbox() async -> [InboxEntry]`
+- `func fetchConversation(with: String) async -> [ConversationMessage]`
+- `func markRead(fromUser: String) async`
+- `var onNewMessage: ((WireMessage) -> Void)?` — fires on each new message from sync loop
 - `var onStateChange: ((String) -> Void)?`
-- `var onError: ((String) -> Void)?` — surface username_taken, invalid_credentials to UI
+- `var onError: ((String) -> Void)?`
+- Sync loop: every 3s poll `GET /messages?since=<ts>` — on new messages call `onNewMessage`
+- Human-readable errors: "That username is already taken.", "Wrong username or password.", "Cannot reach server — is it running?"
 
 **main.swift** — CLI entry point:
 - Args: `--user <name>`, `--password <pass>`, `--server <url>` (default: http://localhost:8765)
-- If `--user` and `--password` not given, prompt interactively on stdin
-- First prompt: `register` or `login`? Then ask username + password
-- Commands after login:
-  - `send <username> <message text>` — send a message
-  - `offline` — simulate going offline
-  - `online` — simulate coming back online
-  - `quit` — logout and exit
-- Print received messages as: `RECEIVED from <username>: <text>`
-- Print state changes as: `STATE: <state>`
-- Print errors as: `ERROR: <reason>` (e.g. username_taken, invalid_credentials)
+- Read stdin on a **DispatchQueue background thread** via `withCheckedContinuation` — never blocks the cooperative thread pool
+- Auth loop: ask register/login, username, password; retry on failure; auto-login after register
+- **Two views — inbox and conversation:**
+
+Inbox view (shown after login, after `back`, and refreshed on new message):
+```
+=== Inbox ===
+  alice   3 unread
+  bob     0 unread
+open <user> | send <user> <msg> | quit
+>
+```
+
+Conversation view (after `open <user>`):
+```
+=== alice ===
+  [10:30]   alice: hi there
+  [10:31]     you: hello!
+─────────────────────────────
+<msg> to send | back | quit
+>
+```
+  - Timestamps formatted `HH:MM` (local time)
+  - Sender label left-padded to fixed width for alignment
+  - `you` for own messages, username for others
+  - Call `markRead(fromUser: openUser)` on open
+
+- **New message while in inbox view** → refresh and reprint inbox
+- **New message while in conversation view:**
+  - If from the open user → append line and reprint prompt
+  - If from someone else → print `[New message from <user>]` and reprint prompt
+- `offline`/`online` remain as hidden test commands
 
 ## Requirements
 - No chat or messaging SDKs
@@ -749,20 +925,27 @@ Each file must begin with exactly this line:
 ## Files to generate
 
 **Models.kt** — @Serializable data classes:
-- `WireMessage`: id, from, to, text, timestamp, status
-- `QueuedMessage`: localId, serverId (nullable), toUser, text, queuedAt, status (enum)
+- `WireMessage`: id, `@SerialName("from") fromUser`, to, text, timestamp (Long), status
+- `QueuedMessage`: localId, serverId (String?), toUser, text, queuedAt (Long), status (MessageStatus)
+- `MessageStatus` enum: PENDING, SENDING, SENT, FAILED
 - `RegisterResponse`: userId, username
 - `LoginResponse`: userId, username, sessionId
-- `SendResponse`: id, timestamp
-- `MessagesResponse`: messages, serverTimestamp
-- `MessageStatus` enum: PENDING, SENDING, SENT, FAILED
+- `SendResponse`: id, timestamp (Long)
+- `MessagesResponse`: messages (List<WireMessage>), serverTimestamp (Long)
+- `InboxEntry`: contact (String), unread (Int), lastTimestamp (Long)
+- `InboxResponse`: inbox (List<InboxEntry>)
+- `ConversationMessage`: id, `@SerialName("from_user") fromUser`, `@SerialName("to_user") toUser`, text, timestamp (Long), read (Int)
+- `ConversationResponse`: messages (List<ConversationMessage>)
 
 **NetworkClient.kt** — OkHttp wrapper:
-- All methods are suspend functions
+- All methods are suspend functions using `withContext(Dispatchers.IO)`
 - `suspend fun register(username: String, password: String, serverURL: String): RegisterResponse`
 - `suspend fun login(username: String, password: String, serverURL: String): LoginResponse`
 - `suspend fun send(to: String, text: String, sessionId: String, serverURL: String): SendResponse`
 - `suspend fun getMessages(since: Long, sessionId: String, serverURL: String): MessagesResponse`
+- `suspend fun getInbox(sessionId: String, serverURL: String): InboxResponse`
+- `suspend fun getConversation(with: String, sessionId: String, serverURL: String): ConversationResponse`
+- `suspend fun markRead(fromUser: String, sessionId: String, serverURL: String)`
 - `suspend fun logout(sessionId: String, serverURL: String)`
 - Throw sealed class NetworkError: Unauthorized, UsernameTaken, ServerError, ConnectionFailed
 
@@ -784,24 +967,49 @@ Each file must begin with exactly this line:
 - `var onStatusChange: ((Boolean) -> Unit)? = null`
 
 **MessageClient.kt** — state machine + coroutine orchestrator:
-- Implement all 6 states as a sealed class or enum: LOGGED_OUT, REGISTERING, LOGGING_IN, ONLINE, FLUSHING, OFFLINE
-- Sync loop: launch coroutine polling every 3 seconds when ONLINE
-- Flush loop: run flushQueue algorithm from spec, as a coroutine
-- `suspend fun register(username: String, password: String)`
-- `suspend fun login(username: String, password: String)`
+- 6 states: LOGGED_OUT, REGISTERING, LOGGING_IN, ONLINE, FLUSHING, OFFLINE
+- `suspend fun register(username: String, password: String): Boolean`
+- `suspend fun login(username: String, password: String): Boolean`
 - `suspend fun sendMessage(to: String, text: String)`
 - `suspend fun logout()`
-- `var onMessageReceived: ((WireMessage) -> Unit)? = null`
+- `suspend fun fetchInbox(): List<InboxEntry>`
+- `suspend fun fetchConversation(with: String): List<ConversationMessage>`
+- `suspend fun markRead(fromUser: String)`
+- `var onNewMessage: ((WireMessage) -> Unit)? = null`
 - `var onStateChange: ((String) -> Unit)? = null`
-- `var onError: ((String) -> Unit)? = null` — surface username_taken, invalid_credentials
+- `var onError: ((String) -> Unit)? = null`
+- Sync loop: poll `GET /messages?since=<ts>` every 3s; call `onNewMessage` per message
+- Human-readable errors: "That username is already taken.", "Wrong username or password.", "Cannot reach server — is it running?"
 
 **Main.kt** — CLI entry point:
 - Args: `--user <name>`, `--password <pass>`, `--server <url>` (default: http://localhost:8765)
-- If args not provided, prompt interactively: `register` or `login`? then username + password
-- Read stdin in a loop after login
-- Commands: `send <username> <message>`, `offline`, `online`, `quit`
-- Print: `RECEIVED from <username>: <text>`, `STATE: <state>`, `ERROR: <reason>`
-- Use `runBlocking` + coroutines
+- Use `runBlocking` + coroutines; read stdin with `readLine()`
+- Auth loop: register or login, retry on failure; auto-login after register
+- **Two views — inbox and conversation** (same layout as Swift):
+
+Inbox view:
+```
+=== Inbox ===
+  alice   3 unread
+  bob     0 unread
+open <user> | send <user> <msg> | quit
+>
+```
+
+Conversation view:
+```
+=== alice ===
+  [10:30]   alice: hi there
+  [10:31]     you: hello!
+─────────────────────────────
+<msg> to send | back | quit
+>
+```
+  - Timestamps formatted `HH:MM`; sender label padded for alignment
+  - Call `markRead(fromUser)` on open
+  - New message from open user → append to conversation; from others → print notification
+
+- `offline`/`online` hidden test commands
 
 ## Requirements
 - No chat or messaging SDKs

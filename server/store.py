@@ -1,12 +1,28 @@
-import threading, uuid, time
+import threading, uuid, time, json, os
 import bcrypt
+
+DATA_FILE = os.path.expanduser("~/.messaging-server/data.json")
+
+def _load():
+    try:
+        os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+        with open(DATA_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"users": {}, "messages": []}
+
+def _save(users, messages):
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+    with open(DATA_FILE, "w") as f:
+        json.dump({"users": users, "messages": messages}, f)
 
 class Store:
     def __init__(self):
         self._lock = threading.Lock()
-        self._users = {}     # username → {userId, username, passwordHash, sessionId}
-        self._sessions = {}  # sessionId → username
-        self._messages = []  # append-only
+        data = _load()
+        self._users = data["users"]      # username → {userId, username, passwordHash, sessionId}
+        self._messages = data["messages"] # append-only list
+        self._sessions = {}              # sessionId → username (rebuilt on boot; sessions don't persist)
 
     def register(self, username: str, password: str) -> dict:
         with self._lock:
@@ -19,6 +35,7 @@ class Store:
                 "passwordHash": bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(),
                 "sessionId": None,
             }
+            _save(self._users, self._messages)
             return {"userId": user_id, "username": username}
 
     def login(self, username: str, password: str) -> dict:
@@ -31,6 +48,7 @@ class Store:
             session_id = str(uuid.uuid4())
             user["sessionId"] = session_id
             self._sessions[session_id] = username
+            _save(self._users, self._messages)
             return {"userId": user["userId"], "username": username, "sessionId": session_id}
 
     def get_user_by_session(self, session_id: str) -> str | None:
@@ -47,6 +65,7 @@ class Store:
                 "status": "delivered"
             }
             self._messages.append(msg)
+            _save(self._users, self._messages)
             return msg
 
     def get_messages(self, for_user: str, since: int = 0) -> list:

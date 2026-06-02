@@ -6,34 +6,19 @@ var serverURL = "http://localhost:8765"
 var argUser: String? = nil
 var argPassword: String? = nil
 
-var args = CommandLine.arguments.dropFirst()
-var argList = Array(args)
+var argList = Array(CommandLine.arguments.dropFirst())
 var i = 0
 while i < argList.count {
     switch argList[i] {
-    case "--server":
-        i += 1
-        if i < argList.count { serverURL = argList[i] }
-    case "--user":
-        i += 1
-        if i < argList.count { argUser = argList[i] }
-    case "--password":
-        i += 1
-        if i < argList.count { argPassword = argList[i] }
-    default:
-        break
+    case "--server":   i += 1; if i < argList.count { serverURL = argList[i] }
+    case "--user":     i += 1; if i < argList.count { argUser = argList[i] }
+    case "--password": i += 1; if i < argList.count { argPassword = argList[i] }
+    default: break
     }
     i += 1
 }
 
-// MARK: - Interactive prompt helpers
-
-func prompt(_ message: String) -> String {
-    print(message, terminator: "")
-    return readLine() ?? ""
-}
-
-// MARK: - Main async entry point
+// MARK: - Setup
 
 let client = MessageClient(serverURL: serverURL)
 
@@ -41,71 +26,110 @@ await client.setupNetworkMonitor()
 
 await client.setCallbacks(
     onMessageReceived: { msg in
-        print("RECEIVED from \(msg.fromUser): \(msg.text)")
+        print("\n📩 Message from \(msg.fromUser): \(msg.text)")
+        print("> ", terminator: "")
+        fflush(stdout)
     },
     onStateChange: { state in
-        print("STATE: \(state)")
+        // Only print state changes that matter to the user
+        switch state {
+        case "online":   print("✓ Connected")
+        case "offline":  print("⚠ Offline — messages will be queued")
+        case "flushing": print("↑ Sending queued messages...")
+        default: break
+        }
     },
     onError: { reason in
-        print("ERROR: \(reason)")
+        print("✗ \(reason)")
     }
 )
 
 let networkMonitor = await client.networkMonitor
 
-enum AuthAction { case register, login }
-var action: AuthAction
-var username: String
-var password: String
+// MARK: - Auth flow
+
+func promptLine(_ label: String) -> String {
+    print(label, terminator: "")
+    fflush(stdout)
+    return readLine()?.trimmingCharacters(in: .whitespaces) ?? ""
+}
 
 if let u = argUser, let p = argPassword {
-    username = u
-    password = p
-    action = .login
+    // Args provided — login directly
+    print("Logging in as \(u)...")
+    let ok = await client.login(username: u, password: p)
+    if !ok { exit(1) }
 } else {
-    let choice = prompt("register or login? ").trimmingCharacters(in: .whitespaces).lowercased()
-    action = choice.hasPrefix("r") ? .register : .login
-    username = prompt("username: ").trimmingCharacters(in: .whitespaces)
-    password = prompt("password: ").trimmingCharacters(in: .whitespaces)
-}
+    // Interactive auth flow — retry until success
+    var loggedIn = false
+    while !loggedIn {
+        let choice = promptLine("register or login? ").lowercased()
 
-if action == .register {
-    await client.register(username: username, password: password)
-    print("Registration complete. Please login.")
-    let loginChoice = prompt("login now? (y/n): ").trimmingCharacters(in: .whitespaces).lowercased()
-    if loginChoice.hasPrefix("y") {
-        await client.login(username: username, password: password)
-    } else {
-        exit(0)
+        if choice.hasPrefix("r") {
+            let username = promptLine("username: ")
+            let password = promptLine("password: ")
+            let ok = await client.register(username: username, password: password)
+            if ok {
+                print("✓ Account created. Logging you in...")
+                let loginOk = await client.login(username: username, password: password)
+                if loginOk { loggedIn = true }
+            }
+            // If failed, loop repeats and asks again
+        } else {
+            let username = promptLine("username: ")
+            let password = promptLine("password: ")
+            let ok = await client.login(username: username, password: password)
+            if ok { loggedIn = true }
+            // If failed, loop repeats and asks again
+        }
     }
-} else {
-    await client.login(username: username, password: password)
 }
 
-// MARK: - Read loop
+// MARK: - Message loop
+// Read stdin on a dedicated thread so the cooperative thread pool
+// (which runs the 3-second sync loop) is never blocked by readLine().
 
-print("Type 'send <user> <message>', 'offline', 'online', or 'quit'")
-while let line = readLine() {
+print("Ready. Type 'send <user> <message>' or 'quit'")
+print("> ", terminator: "")
+fflush(stdout)
+
+// Bridge blocking readLine() into async world without starving the thread pool.
+func nextLine() async -> String? {
+    await withCheckedContinuation { cont in
+        DispatchQueue.global(qos: .userInteractive).async {
+            cont.resume(returning: readLine())
+        }
+    }
+}
+
+while let line = await nextLine() {
     let trimmed = line.trimmingCharacters(in: .whitespaces)
-    if trimmed.isEmpty { continue }
 
-    if trimmed == "quit" {
+    if trimmed.isEmpty {
+        // nothing
+    } else if trimmed == "quit" {
+        print("Logging out...")
         await client.logout()
         exit(0)
-    } else if trimmed == "offline" {
-        networkMonitor.simulateOffline()
-    } else if trimmed == "online" {
-        networkMonitor.simulateOnline()
     } else if trimmed.hasPrefix("send ") {
         let rest = String(trimmed.dropFirst(5))
         if let spaceIdx = rest.firstIndex(of: " ") {
             let toUser = String(rest[rest.startIndex..<spaceIdx])
-            let text = String(rest[rest.index(after: spaceIdx)...])
+            let text   = String(rest[rest.index(after: spaceIdx)...])
             await client.sendMessage(to: toUser, text: text)
+            print("✓ Sent to \(toUser)")
         } else {
             print("Usage: send <username> <message text>")
         }
+    // Hidden test commands for offline queue simulation
+    } else if trimmed == "offline" {
+        networkMonitor.simulateOffline()
+    } else if trimmed == "online" {
+        networkMonitor.simulateOnline()
     } else {
-        print("Unknown command. Use: send <user> <msg> | offline | online | quit")
+        print("Commands: send <user> <message> | quit")
     }
+
+    print("> ", terminator: "")
+    fflush(stdout)
 }
