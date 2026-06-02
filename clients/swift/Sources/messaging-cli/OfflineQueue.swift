@@ -20,6 +20,9 @@ class OfflineQueue {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let dbPath = dir.appendingPathComponent("queue.db").path
         db = try! Connection(dbPath)
+        db.busyTimeout = 5.0                          // wait up to 5s instead of immediately failing
+        try? db.execute("PRAGMA journal_mode=WAL")    // WAL allows concurrent reads during writes
+        try? db.execute("PRAGMA synchronous=NORMAL")  // safe with WAL, faster than FULL
         createTable()
     }
 

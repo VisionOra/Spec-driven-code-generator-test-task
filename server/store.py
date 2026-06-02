@@ -73,4 +73,33 @@ class Store:
             return [m for m in self._messages
                     if m["to"] == for_user and m["timestamp"] > since]
 
+    def get_inbox(self, for_user: str) -> list:
+        with self._lock:
+            contacts = {}
+            for m in self._messages:
+                if m["to"] != for_user:
+                    continue
+                sender = m["from"]
+                if sender not in contacts or m["timestamp"] > contacts[sender]["lastTimestamp"]:
+                    contacts[sender] = {"lastTimestamp": m["timestamp"]}
+                contacts[sender]["unread"] = contacts[sender].get("unread", 0) + (1 if not m.get("read") else 0)
+            return sorted(
+                [{"contact": c, "unread": v["unread"], "lastTimestamp": v["lastTimestamp"]}
+                 for c, v in contacts.items()],
+                key=lambda x: x["lastTimestamp"], reverse=True
+            )
+
+    def get_conversation(self, user_a: str, user_b: str) -> list:
+        with self._lock:
+            return [m for m in self._messages
+                    if (m["from"] == user_a and m["to"] == user_b)
+                    or (m["from"] == user_b and m["to"] == user_a)]
+
+    def mark_read(self, from_user: str, to_user: str):
+        with self._lock:
+            for m in self._messages:
+                if m["from"] == from_user and m["to"] == to_user:
+                    m["read"] = True
+            _save(self._users, self._messages)
+
 store = Store()

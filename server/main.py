@@ -52,6 +52,23 @@ def messages(since: int = 0, x_session_id: str | None = Header(None)):
     server_ts = int(__import__("time").time() * 1000)
     return {"messages": msgs, "serverTimestamp": server_ts}
 
+@app.get("/inbox")
+def inbox(x_session_id: str | None = Header(None)):
+    username = auth(x_session_id)
+    return {"inbox": store.get_inbox(username)}
+
+@app.get("/conversation/{other_user}")
+def conversation(other_user: str, x_session_id: str | None = Header(None)):
+    username = auth(x_session_id)
+    msgs = store.get_conversation(username, other_user)
+    return {"messages": msgs}
+
+@app.post("/mark-read")
+def mark_read(req: dict, x_session_id: str | None = Header(None)):
+    username = auth(x_session_id)
+    store.mark_read(req.get("fromUser", ""), username)
+    return {}
+
 @app.post("/logout")
 def logout(x_session_id: str | None = Header(None)):
     auth(x_session_id)

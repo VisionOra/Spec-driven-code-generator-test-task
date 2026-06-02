@@ -32,10 +32,10 @@ cd clients/swift
 swift build              # Debug build
 swift build -c release  # Release build
 
-# Run with credentials (skips interactive auth)
+# With credentials (auto-registers if user doesn't exist)
 .build/debug/messaging-cli --user alice --password secret
 
-# Interactive mode (prompts for register or login)
+# Interactive mode
 .build/debug/messaging-cli
 ```
 
@@ -50,7 +50,7 @@ cd clients/kotlin
 # Interactive mode (no credentials — prompts for register or login)
 ./gradlew run
 
-# Or build a JAR and run directly
+# Build and run as a standalone JAR
 ./gradlew jar
 java -jar build/libs/messaging-cli-1.0.jar --user alice --password secret
 ```
@@ -58,7 +58,7 @@ java -jar build/libs/messaging-cli-1.0.jar --user alice --password secret
 ### CLI Commands
 Once authenticated:
 ```
-send <username> <message>   # Send a message
+send <username> <message>   # Send a message to another user
 offline                      # Simulate going offline (messages are queued)
 online                       # Simulate coming back online (queue is flushed)
 quit                         # Logout and exit
@@ -82,9 +82,11 @@ Logging out...
 
 When `--user` and `--password` are passed, the client tries to login first.
 If the user doesn't exist yet, it automatically registers and logs in —
-so you never need to register manually when using flags.
+no manual registration step needed.
 
 In interactive mode (no flags), the client asks whether to register or login.
+
+The integration test pre-registers all test users automatically before launching clients.
 
 ```
 POST /register { "username": "alice", "password": "secret" }
@@ -95,8 +97,6 @@ POST /login { "username": "alice", "password": "secret" }
 → 200 { "userId": "...", "username": "alice", "sessionId": "..." }
 → 401 { "error": "invalid_credentials" }
 ```
-
-The integration test pre-registers all test users automatically before launching clients.
 
 ## Regeneration
 
@@ -116,9 +116,9 @@ python3 tests/integration_test.py
 | `spec/protocol-spec.md` | The protocol spec that drives generation |
 | `generator/generate.py` | Generator harness (calls Claude, compile-checks, retries) |
 | `generator/prompts/` | Per-language prompt templates |
-| `clients/swift/` | Generated Swift CLI client |
-| `clients/kotlin/` | Generated Kotlin JVM CLI client |
-| `server/` | Hand-written FastAPI + SQLite server |
+| `clients/swift/` | Swift CLI client |
+| `clients/kotlin/` | Kotlin JVM CLI client |
+| `server/` | Hand-written FastAPI server |
 | `tests/` | Integration test harness |
 
 ## What is generated vs hand-written

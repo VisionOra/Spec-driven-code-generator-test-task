@@ -26,15 +26,15 @@ class MessageClient(
                 if (!isOnline) {
                     if (state == ClientState.ONLINE || state == ClientState.FLUSHING) {
                         currentJob?.cancel()
-                        setState(ClientState.OFFLINE)
+                        changeState(ClientState.OFFLINE)
                     }
                 } else {
                     if (state == ClientState.OFFLINE) {
                         if (offlineQueue.nextPending() != null) {
-                            setState(ClientState.FLUSHING)
+                            changeState(ClientState.FLUSHING)
                             currentJob = scope.launch { runFlushQueue() }
                         } else {
-                            setState(ClientState.ONLINE)
+                            changeState(ClientState.ONLINE)
                             startSyncLoop()
                         }
                     }
@@ -43,38 +43,39 @@ class MessageClient(
         }
     }
 
-    private fun setState(newState: ClientState) {
+    private fun changeState(newState: ClientState) {
         state = newState
         onStateChange?.invoke(newState.name)
     }
 
     suspend fun register(username: String, password: String) {
-        setState(ClientState.REGISTERING)
+        changeState(ClientState.REGISTERING)
         try {
             networkClient.register(username, password, serverURL)
-            setState(ClientState.LOGGED_OUT)
+            changeState(ClientState.LOGGED_OUT)
         } catch (e: NetworkError.UsernameTaken) {
             onError?.invoke("username_taken")
-            setState(ClientState.LOGGED_OUT)
+            changeState(ClientState.LOGGED_OUT)
         } catch (e: NetworkError) {
             onError?.invoke("connection_failed")
-            setState(ClientState.LOGGED_OUT)
+            changeState(ClientState.LOGGED_OUT)
         }
     }
 
     suspend fun login(username: String, password: String) {
-        setState(ClientState.LOGGING_IN)
+        changeState(ClientState.LOGGING_IN)
         try {
             val response = networkClient.login(username, password, serverURL)
             sessionId = response.sessionId
-            setState(ClientState.ONLINE)
+            offlineQueue.initialize(username)
+            changeState(ClientState.ONLINE)
             startSyncLoop()
         } catch (e: NetworkError.Unauthorized) {
             onError?.invoke("invalid_credentials")
-            setState(ClientState.LOGGED_OUT)
+            changeState(ClientState.LOGGED_OUT)
         } catch (e: NetworkError) {
             onError?.invoke("connection_failed")
-            setState(ClientState.LOGGED_OUT)
+            changeState(ClientState.LOGGED_OUT)
         }
     }
 
@@ -94,14 +95,14 @@ class MessageClient(
                 offlineQueue.markPending(localId)
                 sessionId = null
                 currentJob?.cancel()
-                setState(ClientState.LOGGED_OUT)
+                changeState(ClientState.LOGGED_OUT)
             } catch (e: NetworkError.ConnectionFailed) {
                 offlineQueue.markPending(localId)
                 currentJob?.cancel()
-                setState(ClientState.OFFLINE)
+                changeState(ClientState.OFFLINE)
             } catch (e: NetworkError) {
                 offlineQueue.markFailed(localId)
-                setState(ClientState.FLUSHING)
+                changeState(ClientState.FLUSHING)
                 currentJob = scope.launch { runFlushQueue() }
             }
         }
@@ -116,7 +117,7 @@ class MessageClient(
         }
         sessionId = null
         currentJob?.cancel()
-        setState(ClientState.LOGGED_OUT)
+        changeState(ClientState.LOGGED_OUT)
     }
 
     private fun startSyncLoop() {
@@ -143,9 +144,9 @@ class MessageClient(
             }
         } catch (e: NetworkError.Unauthorized) {
             sessionId = null
-            setState(ClientState.LOGGED_OUT)
+            changeState(ClientState.LOGGED_OUT)
         } catch (e: NetworkError.ConnectionFailed) {
-            setState(ClientState.OFFLINE)
+            changeState(ClientState.OFFLINE)
         } catch (e: NetworkError) {
             // transient error — continue
         }
@@ -156,7 +157,7 @@ class MessageClient(
             val msg = offlineQueue.nextPending() ?: break
             val sid = sessionId
             if (sid == null) {
-                setState(ClientState.LOGGED_OUT)
+                changeState(ClientState.LOGGED_OUT)
                 return
             }
             offlineQueue.markSending(msg.localId)
@@ -166,11 +167,11 @@ class MessageClient(
             } catch (e: NetworkError.Unauthorized) {
                 offlineQueue.markPending(msg.localId)
                 sessionId = null
-                setState(ClientState.LOGGED_OUT)
+                changeState(ClientState.LOGGED_OUT)
                 return
             } catch (e: NetworkError.ConnectionFailed) {
                 offlineQueue.markPending(msg.localId)
-                setState(ClientState.OFFLINE)
+                changeState(ClientState.OFFLINE)
                 return
             } catch (e: NetworkError.ServerError) {
                 offlineQueue.markFailed(msg.localId)
@@ -180,7 +181,7 @@ class MessageClient(
             }
         }
         if (state == ClientState.FLUSHING) {
-            setState(ClientState.ONLINE)
+            changeState(ClientState.ONLINE)
             startSyncLoop()
         }
     }

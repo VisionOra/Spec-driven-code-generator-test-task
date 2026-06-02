@@ -6,6 +6,17 @@ Registration returns 409 if a username is already taken — clients must surface
 Login returns 401 for both wrong password and unknown username (same error prevents username enumeration).
 Passwords are bcrypt-hashed server-side; plaintext is never stored.
 
+## Auto-register on first login
+When `--user` and `--password` are passed, the client attempts login first.
+If the server returns `invalid_credentials` (user doesn't exist), it automatically
+calls `/register` then retries login — so first-time users don't need a separate
+registration step when using CLI flags.
+
+Kotlin: `client.state` is a public `@Volatile var` so `Main.kt` can inspect it
+after `login()` returns and decide whether to fall back to registration.
+The internal state-transition method is named `changeState` (not `setState`) to
+avoid a JVM signature clash with the property's generated setter.
+
 ## Protocol: HTTP polling only (no WebSocket)
 Simple to spec, simple to generate, simple to test.
 WebSocket adds reconnection complexity that diverges across platforms.
@@ -16,12 +27,6 @@ iOS Simulator and Android Emulator can't be driven from a Python test harness.
 Swift CLI (Swift Package Manager) and Kotlin JVM (Gradle application) run as
 regular processes — testable with subprocess.Popen. Mobile UI is a FUTURE.md item.
 
-## Gradle stdin wiring
-`./gradlew run` does not connect stdin to the process by default — `readLine()` returns
-null immediately, silently skipping the interactive auth prompt.
-`build.gradle` adds `run { standardInput = System.in }` to fix this.
-Running via `java -jar` is unaffected; stdin always works there.
-
 ## No YAML spec parser
 The spec is Markdown injected directly into prompts.
 No intermediate data model, no parser that can fail, fewer moving parts.
@@ -29,6 +34,21 @@ No intermediate data model, no parser that can fail, fewer moving parts.
 ## localId / serverId split in offline queue
 A queued message has no server ID until the POST /send ACK.
 Two-field design prevents ID collisions and makes deduplication unambiguous.
+
+## User-scoped offline queue databases
+Both clients store the offline queue at `~/.messaging-cli/<username>/queue.db`.
+A shared queue across users causes `isDuplicate()` to match the other user's sent
+message IDs, silently dropping all received messages.
+
+Swift: `OfflineQueue(username:)` is created after login with the username from the
+login response. Kotlin: `OfflineQueue` is lazy — `initialize(username)` is called
+from `MessageClient.login()` after a successful login response.
+
+## RECEIVED prefix in onMessageReceived
+Both clients print `RECEIVED from <user>: <text>` when a new message arrives.
+This machine-readable line lets the integration test harness detect delivery
+without parsing the conversational UI output. The user-facing display (`📩 Message from …`)
+follows on the next line.
 
 ## Generator uses --dangerously-skip-permissions
 Claude Code's subprocess writes files directly to disk instead of parsing stdout.
@@ -41,18 +61,18 @@ LLMs produce non-compilable code on first attempt ~30% of the time.
 The harness auto-retries once with compiler errors injected into the prompt.
 This makes regeneration reliable without manual intervention.
 
-## RECEIVED prefix in onMessageReceived
-Both clients print `RECEIVED from <user>: <text>` when a new message arrives.
-This machine-readable line lets the integration test harness detect delivery
-without parsing the conversational UI output. The user-facing display follows on
-the next line (Swift: `📩 Message from …`, Kotlin: same via the callback).
-
 ## Integration test pre-registers users
 The test harness calls POST /register before launching each client process.
 This lets clients be started with `--user` and `--password` flags, bypassing
 the interactive auth prompt so processes can be driven entirely from stdin/stdout.
 A 409 response (username already exists) is silently ignored so the same usernames
 can be reused across test runs without clearing the database.
+
+## Gradle stdin wiring
+`./gradlew run` does not connect stdin to the process by default — `readLine()` returns
+null immediately, silently skipping the interactive auth prompt.
+`build.gradle` adds `run { standardInput = System.in }` to fix this.
+Running via `java -jar` is unaffected; stdin always works there.
 
 ## Reproducibility = behavioral equivalence
 Generated code will differ in variable names and structure between runs.

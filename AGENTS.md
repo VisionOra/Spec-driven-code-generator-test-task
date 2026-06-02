@@ -12,8 +12,6 @@ claude --print --dangerously-skip-permissions --add-dir <output_dir>
 - `--dangerously-skip-permissions` — lets Claude write files without per-file prompts
 - `--add-dir <output_dir>` — grants write access to the client output directory
 
-Claude writes source files directly to the output directory using its file tools.
-
 Verify the setup before running the generator:
 ```bash
 echo "Write hello world in Python" | claude --print
@@ -47,11 +45,24 @@ Both clients expose three callbacks that the test harness and CLI rely on:
 | Callback | Triggered when |
 |----------|---------------|
 | `onMessageReceived` | A new message arrives from the sync loop |
-| `onStateChange` | Client state changes (ONLINE, OFFLINE, FLUSHING, …) |
+| `onStateChange` | Client state changes (`online`, `offline`, `flushing`, …) |
 | `onError` | A user-facing error occurs |
 
 When `onMessageReceived` fires, clients print `RECEIVED from <user>: <text>` to stdout.
 The integration test's reader thread captures lines containing `RECEIVED` to verify delivery.
+
+## Client States
+
+Both clients implement the same 6-state machine:
+
+```
+LOGGED_OUT → REGISTERING → LOGGED_OUT   (after register)
+LOGGED_OUT → LOGGING_IN  → ONLINE       (after successful login)
+ONLINE     → OFFLINE                    (network lost)
+ONLINE     → FLUSHING    → ONLINE       (flush pending queue)
+OFFLINE    → FLUSHING / ONLINE          (network restored)
+ANY        → LOGGED_OUT                 (401 from server)
+```
 
 ## What Claude Code Generates
 - All `.swift` files in `clients/swift/Sources/messaging-cli/`
