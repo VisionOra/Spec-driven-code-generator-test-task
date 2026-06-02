@@ -23,3 +23,7 @@ dependencies {
 application {
     mainClass = 'com.messaging.MainKt'
 }
+
+run {
+    standardInput = System.in
+}

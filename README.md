@@ -32,38 +32,42 @@ cd clients/swift
 swift build              # Debug build
 swift build -c release  # Release build
 
-# Register & login
+# Run with credentials (skips interactive auth)
 .build/debug/messaging-cli --user alice --password secret
 
-# Interactive mode (prompts for register/login)
+# Interactive mode (prompts for register or login)
 .build/debug/messaging-cli
 ```
 
 ### Kotlin
 ```bash
 cd clients/kotlin
-./gradlew build                # Full build (compile + tests)
+./gradlew build    # Compile + check
 
-# Register & login (note: args must be in quotes)
-./gradlew run --args='--user alice --password Abc@123'
+# Run via Gradle (stdin is wired — interactive prompts work)
+./gradlew run --args='--user alice --password secret'
 
-# Or run the JAR directly
-./gradlew jar  # Build the JAR first
+# Interactive mode (no credentials — prompts for register or login)
+./gradlew run
+
+# Or build a JAR and run directly
+./gradlew jar
 java -jar build/libs/messaging-cli-1.0.jar --user alice --password secret
 ```
 
-### Messaging Commands
-Once authenticated, you can:
+### CLI Commands
+Once authenticated:
 ```
-send <username> <message>   # Send a message to another user
-offline                      # Simulate offline (queues messages)
-online                       # Simulate back online (flushes queue)
+send <username> <message>   # Send a message
+offline                      # Simulate going offline (messages are queued)
+online                       # Simulate coming back online (queue is flushed)
 quit                         # Logout and exit
 ```
 
-**Example interaction:**
+**Example session:**
 ```
 $ .build/debug/messaging-cli --user alice --password secret
+Logging in as alice...
 ✓ Connected
 Ready. Type 'send <user> <message>' or 'quit'
 > send bob Hello from Alice!
@@ -76,22 +80,27 @@ Logging out...
 
 ## Auth Flow
 
-Users must register before logging in:
+When `--user` and `--password` are passed, the client tries to login first.
+If the user doesn't exist yet, it automatically registers and logs in —
+so you never need to register manually when using flags.
+
+In interactive mode (no flags), the client asks whether to register or login.
 
 ```
-# Register
 POST /register { "username": "alice", "password": "secret" }
 → 201 { "userId": "...", "username": "alice" }
-→ 409 { "error": "username_taken" }   # if name already taken
+→ 409 { "error": "username_taken" }
 
-# Login
 POST /login { "username": "alice", "password": "secret" }
 → 200 { "userId": "...", "username": "alice", "sessionId": "..." }
 → 401 { "error": "invalid_credentials" }
 ```
 
+The integration test pre-registers all test users automatically before launching clients.
+
 ## Regeneration
-To verify from scratch:
+
+To regenerate from scratch and verify everything still passes:
 ```bash
 rm clients/swift/Sources/messaging-cli/*.swift
 rm clients/kotlin/src/main/kotlin/com/messaging/*.kt
@@ -100,15 +109,18 @@ python3 generator/generate.py --lang kotlin --output clients/kotlin/src/main/kot
 python3 tests/integration_test.py
 ```
 
-## What is generated vs hand-written
-- **Generated**: all .swift and .kt files in clients/
-- **Hand-written**: spec/, generator/, server/, tests/, Package.swift, build.gradle
+## Project Layout
 
-## Where to find things
-- Spec: `spec/protocol-spec.md`
-- Generator: `generator/generate.py`
-- Prompts: `generator/prompts/`
-- Generated Swift client: `clients/swift/Sources/messaging-cli/`
-- Generated Kotlin client: `clients/kotlin/src/main/kotlin/com/messaging/`
-- Server: `server/`
-- Tests: `tests/`
+| Path | Description |
+|------|-------------|
+| `spec/protocol-spec.md` | The protocol spec that drives generation |
+| `generator/generate.py` | Generator harness (calls Claude, compile-checks, retries) |
+| `generator/prompts/` | Per-language prompt templates |
+| `clients/swift/` | Generated Swift CLI client |
+| `clients/kotlin/` | Generated Kotlin JVM CLI client |
+| `server/` | Hand-written FastAPI + SQLite server |
+| `tests/` | Integration test harness |
+
+## What is generated vs hand-written
+- **Generated**: all `.swift` and `.kt` files under `clients/`
+- **Hand-written**: `spec/`, `generator/`, `server/`, `tests/`, `Package.swift`, `build.gradle`

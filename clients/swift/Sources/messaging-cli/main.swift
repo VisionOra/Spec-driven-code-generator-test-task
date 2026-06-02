@@ -26,6 +26,7 @@ await client.setupNetworkMonitor()
 
 await client.setCallbacks(
     onMessageReceived: { msg in
+        print("RECEIVED from \(msg.fromUser): \(msg.text)")
         print("\n📩 Message from \(msg.fromUser): \(msg.text)")
         print("> ", terminator: "")
         fflush(stdout)
@@ -55,10 +56,14 @@ func promptLine(_ label: String) -> String {
 }
 
 if let u = argUser, let p = argPassword {
-    // Args provided — login directly
     print("Logging in as \(u)...")
     let ok = await client.login(username: u, password: p)
-    if !ok { exit(1) }
+    if !ok {
+        print("User not found — registering '\(u)'...")
+        let _ = await client.register(username: u, password: p)
+        let loginOk = await client.login(username: u, password: p)
+        if !loginOk { exit(1) }
+    }
 } else {
     // Interactive auth flow — retry until success
     var loggedIn = false

@@ -14,7 +14,7 @@ class MessageClient(
     var onStateChange: ((String) -> Unit)? = null
     var onError: ((String) -> Unit)? = null
 
-    @Volatile private var state: ClientState = ClientState.LOGGED_OUT
+    @Volatile var state: ClientState = ClientState.LOGGED_OUT
     @Volatile private var sessionId: String? = null
     @Volatile private var lastServerTimestamp: Long = 0L
     private var currentJob: Job? = null

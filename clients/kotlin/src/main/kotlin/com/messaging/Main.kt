@@ -29,6 +29,11 @@ fun main(args: Array<String>): Unit = runBlocking {
 
     if (user != null && password != null) {
         client.login(user, password)
+        if (client.state != ClientState.ONLINE) {
+            println("User not found — registering '$user'...")
+            client.register(user, password)
+            client.login(user, password)
+        }
     } else {
         print("register or login? ")
         System.out.flush()
