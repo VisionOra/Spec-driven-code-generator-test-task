@@ -1,1 +1,10 @@
 __pycache__/
+*.pyc
+
+# Swift build artifacts
+clients/swift/.build/
+
+# Kotlin/Gradle build artifacts
+clients/kotlin/.gradle/
+clients/kotlin/build/
+clients/kotlin/app/build/

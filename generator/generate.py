@@ -4,53 +4,40 @@ Usage:
   python generator/generate.py --lang swift  --output clients/swift/Sources/messaging-cli/
   python generator/generate.py --lang kotlin --output clients/kotlin/app/src/main/kotlin/com/messaging/
 """
-import argparse, subprocess, sys, re
+import argparse, subprocess, sys
 from pathlib import Path
 
 SPEC      = Path("spec/protocol-spec.md")
 PROMPTS   = Path("generator/prompts")
 MAX_RETRY = 2
 
-def build_prompt(lang: str, spec: str, errors: str = "") -> str:
+def build_prompt(lang: str, spec: str, out_dir: Path, errors: str = "") -> str:
     template = (PROMPTS / f"{lang}_prompt.md").read_text()
-    prompt = template.replace("{{SPEC}}", spec)
+    prompt = template.replace("{{SPEC}}", spec).replace("{{OUTPUT_DIR}}", str(out_dir))
     if errors:
-        prompt += f"\n\n## COMPILATION ERRORS — fix these\n```\n{errors[:1500]}\n```\nRegenerate all files with fixes applied."
+        prompt += f"\n\n## COMPILATION ERRORS — fix these\n```\n{errors[:1500]}\n```\nRewrite only the files that have errors and save them to the same output directory."
     return prompt
 
-def call_claude(prompt: str) -> str:
+def call_claude(prompt: str, out_dir: Path) -> None:
     result = subprocess.run(
-        ["claude", "--print",
-         "--disallowedTools", "Edit,Write,Bash,computer,str_replace_based_edit_tool"],
-        input=prompt, capture_output=True, text=True, timeout=300
+        ["claude", "--print", "--dangerously-skip-permissions",
+         "--add-dir", str(out_dir.resolve())],
+        input=prompt, capture_output=True, text=True, timeout=600
     )
+    print(result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout)
     if result.returncode != 0:
         print(f"Claude error:\n{result.stderr}", file=sys.stderr)
         sys.exit(1)
-    return result.stdout
 
-def extract_files(output: str) -> dict[str, str]:
-    # Matches: ```swift\n// filename: Foo.swift\ncontent\n```
-    pattern = r'```(?:swift|kotlin)\n// filename: ([^\n]+)\n(.*?)```'
-    files = {}
-    for m in re.finditer(pattern, output, re.DOTALL):
-        files[m.group(1).strip()] = m.group(2)
-    return files
-
-def write_files(files: dict[str, str], out_dir: Path):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for name, content in files.items():
-        header = f"// GENERATED — regenerate: python generator/generate.py --lang {'swift' if name.endswith('.swift') else 'kotlin'} --output {out_dir}\n"
-        (out_dir / name).write_text(header + content)
-        print(f"  wrote {out_dir / name}")
-
-def compile_check(lang: str, root: Path) -> tuple[bool, str]:
+def compile_check(lang: str, out_dir: Path) -> tuple[bool, str]:
     if lang == "swift":
-        r = subprocess.run(["swift", "build"], cwd=root.parents[2],
-                           capture_output=True, text=True)
+        # out_dir = clients/swift/Sources/messaging-cli/ → parents[1] = clients/swift/
+        r = subprocess.run(["swift", "build"], cwd=out_dir.parents[1],
+                           capture_output=True, text=True, timeout=300)
     else:
-        r = subprocess.run(["./gradlew", "compileKotlin"], cwd=root.parents[3],
-                           capture_output=True, text=True)
+        # out_dir = clients/kotlin/src/main/kotlin/com/messaging/ → parents[5] = clients/kotlin/
+        r = subprocess.run(["./gradlew", "compileKotlin"], cwd=out_dir.parents[5],
+                           capture_output=True, text=True, timeout=300)
     return r.returncode == 0, r.stderr + r.stdout
 
 def main():
@@ -59,27 +46,27 @@ def main():
     ap.add_argument("--output", required=True, type=Path)
     args = ap.parse_args()
 
+    out_dir = args.output.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     spec   = SPEC.read_text()
     errors = ""
 
     for attempt in range(1, MAX_RETRY + 1):
-        print(f"[{args.lang}] attempt {attempt}/{MAX_RETRY}...")
-        output = call_claude(build_prompt(args.lang, spec, errors))
-        files  = extract_files(output)
+        print(f"[{args.lang}] attempt {attempt}/{MAX_RETRY} — calling Claude...")
+        call_claude(build_prompt(args.lang, spec, out_dir, errors), out_dir)
 
+        files = list(out_dir.glob(f"*.{'swift' if args.lang == 'swift' else 'kt'}"))
         if not files:
-            print("No files extracted — check prompt output format", file=sys.stderr)
-            print(output[:500])
+            print(f"No {'Swift' if args.lang == 'swift' else 'Kotlin'} files found in {out_dir}", file=sys.stderr)
             sys.exit(1)
+        print(f"  found: {[f.name for f in files]}")
 
-        write_files(files, args.output)
-        ok, errors = compile_check(args.lang, args.output)
-
+        ok, errors = compile_check(args.lang, out_dir)
         if ok:
             print(f"[{args.lang}] ✓ compiled successfully")
             return
-
-        print(f"[{args.lang}] compile failed:\n{errors[:300]}")
+        print(f"[{args.lang}] compile failed:\n{errors[:500]}")
 
     print(f"[{args.lang}] failed after {MAX_RETRY} attempts — fix prompts and retry")
     sys.exit(1)
