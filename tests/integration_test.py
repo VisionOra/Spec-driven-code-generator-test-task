@@ -1,17 +1,33 @@
-import subprocess, time, threading, sys
+import subprocess, time, threading, sys, urllib.request, json
 from pathlib import Path
 
 SERVER_URL = "http://localhost:8765"
+TEST_PASSWORD = "testpass123"
+
+def pre_register(username: str, password: str = TEST_PASSWORD):
+    """Register user; ignore 409 if already exists."""
+    data = json.dumps({"username": username, "password": password}).encode()
+    req = urllib.request.Request(
+        f"{SERVER_URL}/register", data=data,
+        headers={"Content-Type": "application/json"}
+    )
+    try:
+        urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        if e.code != 409:
+            raise
 
 class CLIClient:
-    def __init__(self, lang: str, username: str):
+    def __init__(self, lang: str, username: str, password: str = TEST_PASSWORD):
+        pre_register(username, password)
+
         if lang == "swift":
             cmd = ["swift", "run", "messaging-cli",
-                   "--user", username, "--server", SERVER_URL]
+                   "--user", username, "--password", password, "--server", SERVER_URL]
             cwd = Path("clients/swift")
         else:
             cmd = ["./gradlew", "run",
-                   "--args", f"--user {username} --server {SERVER_URL}"]
+                   "--args", f"--user {username} --password {password} --server {SERVER_URL}"]
             cwd = Path("clients/kotlin")
 
         self.username = username
